@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="banner.png" alt="Force Fabric MCP Server — Detect & Optimize" width="100%">
+</p>
+
 # Force Fabric MCP Server
 
 A **Model Context Protocol (MCP) server** that provides live optimization analysis for Microsoft Fabric items. It connects to your Fabric tenant via Azure authentication and runs **100+ rules** across Lakehouses, Warehouses, Eventhouses, and Semantic Models — detecting real issues with specific table and column names.
@@ -138,9 +142,144 @@ Only issues (FAIL/WARN) are shown in the table. Passed rules are counted in the 
 | `warehouse_analyze_query_patterns` | Focused query performance analysis |
 | `eventhouse_list` | List eventhouses in a workspace |
 | `eventhouse_list_kql_databases` | List KQL databases |
-| `eventhouse_optimization_recommendations` | Full scan with 13+ rules |
+| `eventhouse_optimization_recommendations` | Full scan with 13+ rules per KQL DB |
 | `semantic_model_list` | List semantic models |
 | `semantic_model_optimization_recommendations` | Full scan with 32 rules |
+
+## Complete Rule Reference
+
+### 🏠 Lakehouse Rules (29)
+
+| Rule | Category | Severity | Description |
+|------|----------|----------|-------------|
+| LH-001 | Availability | HIGH | SQL Endpoint is active and provisioned |
+| LH-002 | Maintainability | LOW | Lakehouse follows medallion naming (bronze/silver/gold) |
+| LH-003 | Performance | HIGH | All tables use Delta format |
+| LH-004 | Performance | MEDIUM | Delta tables have regular OPTIMIZE + VACUUM |
+| LH-005 | Data Quality | MEDIUM | No empty tables |
+| LH-006 | Performance | MEDIUM | No over-provisioned string columns (>500 chars) |
+| LH-007 | Data Quality | HIGH | Key/ID columns are NOT NULL |
+| LH-008 | Data Quality | MEDIUM | No float/real precision issues |
+| LH-009 | Maintainability | LOW | Column naming convention (no spaces/special chars) |
+| LH-010 | Data Quality | MEDIUM | Date columns use proper DATE/DATETIME2 types |
+| LH-011 | Data Quality | MEDIUM | Numeric columns use proper numeric types |
+| LH-012 | Maintainability | LOW | No excessively wide tables (>30 columns) |
+| LH-013 | Data Quality | MEDIUM | Schema has NOT NULL constraints (not >90% nullable) |
+| LH-014 | Maintainability | LOW | Tables have audit columns (created_at/updated_at) |
+| LH-015 | Data Quality | LOW | Consistent date types per table |
+| LH-S01 | Security | HIGH | No unprotected sensitive/PII columns |
+| LH-S02 | Performance | INFO | Large tables (>1M rows) identified |
+| LH-S03 | Maintainability | HIGH | No deprecated data types (TEXT/NTEXT/IMAGE) |
+| LH-S04 | Data Quality | MEDIUM | All tables have key columns |
+| LH-016 | Performance | MEDIUM | Large tables (>10GB) are partitioned |
+| LH-017 | Maintenance | MEDIUM | Regular VACUUM executed (within 7 days) |
+| LH-018 | Performance | MEDIUM | Regular OPTIMIZE executed |
+| LH-019 | Performance | HIGH | No small file problem (>50% files <25MB) |
+| LH-020 | Performance | MEDIUM | Auto-optimize enabled |
+| LH-021 | Maintenance | LOW | Retention policy configured |
+| LH-022 | Performance | LOW | Delta log version count reasonable (<100) |
+| LH-023 | Performance | MEDIUM | Low write amplification (MERGE/UPDATE/DELETE ratio) |
+| LH-024 | Performance | LOW | Data skipping configured |
+| LH-025 | Performance | MEDIUM | Z-Order applied on large tables (>10GB) |
+
+### 🏗️ Warehouse Rules (39)
+
+| Rule | Category | Severity | Description |
+|------|----------|----------|-------------|
+| WH-001 | Data Quality | HIGH | Primary keys defined (NOT ENFORCED) |
+| WH-002 | Maintainability | HIGH | No deprecated data types (TEXT/NTEXT/IMAGE) |
+| WH-003 | Data Quality | MEDIUM | No float/real precision issues |
+| WH-004 | Performance | MEDIUM | No over-provisioned columns (>500 chars) |
+| WH-005 | Maintainability | LOW | Column naming convention |
+| WH-006 | Maintainability | LOW | Table naming convention |
+| WH-007 | Maintainability | LOW | No SELECT * in views |
+| WH-008 | Performance | MEDIUM | Statistics are fresh (<30 days) |
+| WH-009 | Data Quality | MEDIUM | No disabled/untrusted constraints |
+| WH-010 | Data Quality | HIGH | Key columns are NOT NULL |
+| WH-011 | Maintainability | MEDIUM | No empty tables |
+| WH-012 | Maintainability | MEDIUM | No excessively wide tables (>50 columns) |
+| WH-013 | Data Quality | LOW | Consistent date types per table |
+| WH-014 | Maintainability | MEDIUM | Foreign keys defined |
+| WH-015 | Performance | MEDIUM | No large BLOB/MAX columns |
+| WH-016 | Maintainability | LOW | Tables have audit columns |
+| WH-017 | Data Quality | HIGH | No circular foreign keys |
+| WH-018 | Security | HIGH | Sensitive data protected (PII masking) |
+| WH-019 | Security | MEDIUM | Row-Level Security defined |
+| WH-020 | Security | MEDIUM | Minimal db_owner privileges |
+| WH-021 | Maintainability | LOW | No over-complex views (>10 dependencies) |
+| WH-022 | Maintainability | LOW | Minimal cross-schema dependencies |
+| WH-023 | Performance | HIGH | No very slow queries (>60s) |
+| WH-024 | Performance | HIGH | No frequently slow queries (>10x and >10s avg) |
+| WH-025 | Reliability | MEDIUM | No recent query failures |
+| WH-026 | Performance | HIGH | AUTO_UPDATE_STATISTICS enabled |
+| WH-027 | Performance | MEDIUM | Result set caching enabled |
+| WH-028 | Concurrency | MEDIUM | Snapshot isolation enabled |
+| WH-029 | Reliability | MEDIUM | Page verify CHECKSUM |
+| WH-030 | Standards | LOW | ANSI settings correct |
+| WH-031 | Availability | HIGH | Database ONLINE |
+| WH-032 | Performance | MEDIUM | All tables have statistics |
+| WH-033 | Performance | MEDIUM | Optimal data types |
+| WH-034 | Maintainability | LOW | No near-empty tables (<10 rows) |
+| WH-035 | Maintainability | LOW | Stored procedures documented |
+| WH-036 | Data Quality | MEDIUM | NOT NULL columns have defaults |
+| WH-037 | Maintainability | LOW | Consistent string types (varchar/nvarchar) |
+| WH-038 | Maintainability | LOW | Schemas are documented |
+| WH-039 | Performance | MEDIUM | Query performance healthy (avg <5s) |
+
+### 📊 Eventhouse Rules (13 per KQL Database)
+
+| Rule | Category | Severity | Description |
+|------|----------|----------|-------------|
+| EH-001 | Availability | HIGH | Query endpoint available |
+| EH-002 | Performance | HIGH | No extent fragmentation |
+| EH-003 | Performance | MEDIUM | Good compression ratio (>40%) |
+| EH-004 | Performance | MEDIUM | Caching policy configured |
+| EH-005 | Data Management | MEDIUM | Retention policy configured |
+| EH-006 | Reliability | HIGH | Materialized views healthy |
+| EH-007 | Data Quality | MEDIUM | Data is fresh (<7 days) |
+| EH-008 | Performance | HIGH | No slow query patterns (>30s avg) |
+| EH-009 | Reliability | MEDIUM | No recent failed commands |
+| EH-010 | Reliability | HIGH | No ingestion failures |
+| EH-011 | Performance | INFO | Streaming ingestion config |
+| EH-012 | Reliability | MEDIUM | Continuous exports healthy |
+| EH-013 | Performance | MEDIUM | Hot cache coverage (>50% hot) |
+
+### 📐 Semantic Model Rules (32)
+
+| Rule | Category | Severity | Description |
+|------|----------|----------|-------------|
+| SM-001 | DAX | MEDIUM | Avoid IFERROR function |
+| SM-002 | DAX | MEDIUM | Use DIVIDE function instead of / |
+| SM-003 | DAX | HIGH | No EVALUATEANDLOG in production |
+| SM-004 | DAX | MEDIUM | Use TREATAS not INTERSECT |
+| SM-005 | DAX | LOW | No duplicate measure definitions |
+| SM-006 | DAX | MEDIUM | Filter by columns not tables |
+| SM-007 | DAX | LOW | Avoid adding 0 to measures |
+| SM-008 | Maintenance | LOW | Measures have documentation |
+| SM-009 | Maintenance | HIGH | Model has tables |
+| SM-010 | Performance | MEDIUM | Model has date table |
+| SM-011 | DAX | MEDIUM | Avoid 1-(x/y) syntax |
+| SM-012 | DAX | LOW | No direct measure references |
+| SM-013 | DAX | MEDIUM | Avoid nested CALCULATE |
+| SM-014 | DAX | LOW | Use SUM instead of SUMX for simple aggregation |
+| SM-015 | Formatting | LOW | Measures have format string |
+| SM-016 | DAX | MEDIUM | Avoid FILTER(ALL(...)) |
+| SM-017 | Formatting | LOW | Measure naming convention |
+| SM-018 | Performance | LOW | Reasonable table count (<20) |
+| SM-B01 | Data Types | HIGH | No high cardinality text columns |
+| SM-B02 | Data Types | HIGH | No description/comment columns |
+| SM-B03 | Data Types | HIGH | No GUID/UUID columns in model |
+| SM-B04 | Data Types | MEDIUM | No constant columns (cardinality=1) |
+| SM-B05 | Data Types | MEDIUM | No booleans stored as text |
+| SM-B06 | Data Types | MEDIUM | No dates stored as text |
+| SM-B07 | Data Types | MEDIUM | No numbers stored as text |
+| SM-B08 | Data Types | MEDIUM | Integer keys instead of string keys |
+| SM-B09 | Data Types | MEDIUM | No excessively wide tables |
+| SM-B10 | Data Types | HIGH | No extremely wide tables (>100 cols) |
+| SM-B11 | Data Types | HIGH | No multiple high-cardinality columns |
+| SM-B12 | Data Types | LOW | No single column tables |
+| SM-B13 | Data Types | MEDIUM | No high-precision timestamps |
+| SM-B14 | Data Types | LOW | No low cardinality columns in fact tables |
 
 ## Architecture
 
