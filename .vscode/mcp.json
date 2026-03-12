@@ -1,0 +1,11 @@
+{
+  "servers": {
+    "fabric-optimization": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["dist/index.js"],
+      "cwd": "${workspaceFolder}",
+      "env": {}
+    }
+  }
+}

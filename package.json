@@ -1,0 +1,30 @@
+{
+  "name": "fabric-optimization-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP Server for optimizing Microsoft Fabric items (Lakehouse, Warehouse, Eventhouse, Semantic Models)",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch"
+  },
+  "keywords": [
+    "mcp",
+    "fabric",
+    "optimization",
+    "lakehouse",
+    "warehouse",
+    "eventhouse"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@azure/identity": "^4.6.0",
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "tedious": "^19.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
