@@ -1,5 +1,6 @@
 import { getAccessToken } from "../auth/fabricAuth.js";
 import { getTokenForScope } from "../auth/fabricAuth.js";
+import { XMLParser } from "fast-xml-parser";
 
 // ──────────────────────────────────────────────
 // XMLA Client — connects to Fabric/Power BI
@@ -7,6 +8,14 @@ import { getTokenForScope } from "../auth/fabricAuth.js";
 // ──────────────────────────────────────────────
 
 const ANALYSIS_SCOPE = "https://analysis.windows.net/powerbi/api/.default";
+
+const xmlParser = new XMLParser({
+  ignoreAttributes: false,
+  attributeNamePrefix: "@_",
+  textNodeName: "#text",
+  isArray: (tagName) => tagName === "row" || tagName === "xsd:element",
+  removeNSPrefix: true,
+});
 
 /**
  * Get the correct XMLA endpoint URL for a workspace.
@@ -28,8 +37,6 @@ export async function executeXmlaQuery(
 ): Promise<Record<string, unknown>[]> {
   const token = await getTokenForScope(ANALYSIS_SCOPE);
   const xmlaUrl = getXmlaUrl(workspaceName);
-
-  const dataSource = `powerbi://api.powerbi.com/v1.0/myorg/${workspaceName}`;
 
   const soapEnvelope = `<?xml version="1.0" encoding="UTF-8"?>
 <Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">
@@ -62,8 +69,8 @@ export async function executeXmlaQuery(
   });
 
   if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`XMLA query failed (${response.status}): ${errorText.substring(0, 500)}`);
+    const errorText = (await response.text()).substring(0, 500);
+    throw new Error(`XMLA query failed (${response.status}): ${errorText}`);
   }
 
   const xml = await response.text();
@@ -107,96 +114,47 @@ function escapeXml(str: string): string {
 }
 
 /**
- * Parse XMLA SOAP response into rows.
- * Handles the standard Analysis Services tabular response format.
+ * Parse XMLA SOAP response using fast-xml-parser.
  */
 function parseXmlaResponse(xml: string): Record<string, unknown>[] {
-  const rows: Record<string, unknown>[] = [];
+  const parsed = xmlParser.parse(xml);
+
+  // Navigate SOAP envelope
+  const envelope = parsed?.Envelope ?? parsed?.["soap:Envelope"] ?? parsed;
+  const body = envelope?.Body ?? envelope?.["soap:Body"] ?? envelope;
 
   // Check for SOAP Fault
-  const faultMatch = xml.match(/<faultstring[^>]*>([\s\S]*?)<\/faultstring>/);
-  if (faultMatch) {
-    throw new Error(`XMLA SOAP Fault: ${faultMatch[1]}`);
+  const fault = body?.Fault ?? body?.["soap:Fault"];
+  if (fault) {
+    const faultString = fault?.faultstring ?? fault?.detail?.Error?.["@_Description"] ?? "Unknown SOAP fault";
+    throw new Error(`XMLA SOAP Fault: ${faultString}`);
   }
+
+  // Navigate to the execute response
+  const execResponse = body?.ExecuteResponse ?? body;
+  const returnVal = execResponse?.return ?? execResponse;
+  const root = returnVal?.root ?? returnVal;
 
   // Check for Analysis Services error
-  const errorMatch = xml.match(/<Error[^>]*Description="([^"]*)"[^>]*>/);
-  if (errorMatch) {
-    throw new Error(`XMLA Error: ${errorMatch[1]}`);
+  const error = root?.Exception ?? root?.Messages?.Error;
+  if (error) {
+    const desc = Array.isArray(error) ? error[0]?.["@_Description"] : error?.["@_Description"];
+    throw new Error(`XMLA Error: ${desc ?? "Unknown error"}`);
   }
 
-  // Extract column names from schema
-  const columnNames: string[] = [];
-  const schemaRegex = /<xsd:element name="([^"]+)"/g;
-  let schemaMatch;
-  // Skip the first "row" element definition
-  const schemaSection = xml.match(/<xsd:complexType[^>]*>[\s\S]*?<\/xsd:complexType>/);
-  if (schemaSection) {
-    while ((schemaMatch = schemaRegex.exec(schemaSection[0])) !== null) {
-      if (schemaMatch[1] !== "row") {
-        columnNames.push(schemaMatch[1]);
-      }
+  // Extract rows
+  const rowData = root?.row;
+  if (!rowData) return [];
+
+  const rowArray = Array.isArray(rowData) ? rowData : [rowData];
+  return rowArray.map((row: Record<string, unknown>) => {
+    const result: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(row)) {
+      if (key.startsWith("@_") || key === "#text") continue;
+      result[key] = typeof value === "object" && value !== null && "#text" in (value as Record<string, unknown>)
+        ? (value as Record<string, unknown>)["#text"]
+        : value;
     }
-  }
-
-  if (columnNames.length === 0) {
-    // Try alternative schema format
-    const altSchemaRegex = /<xsd:element[^>]+name="([^"]+)"[^>]*\/>/g;
-    const fullSchema = xml.match(/<xsd:schema[\s\S]*?<\/xsd:schema>/);
-    if (fullSchema) {
-      while ((schemaMatch = altSchemaRegex.exec(fullSchema[0])) !== null) {
-        if (schemaMatch[1] !== "root" && schemaMatch[1] !== "row") {
-          columnNames.push(schemaMatch[1]);
-        }
-      }
-    }
-  }
-
-  // Extract row data
-  const rowRegex = /<row>([\s\S]*?)<\/row>/g;
-  let rowMatch;
-  while ((rowMatch = rowRegex.exec(xml)) !== null) {
-    const row: Record<string, unknown> = {};
-    const rowContent = rowMatch[1];
-
-    for (const colName of columnNames) {
-      const valRegex = new RegExp(`<${escapeRegex(colName)}[^>]*>([\s\S]*?)<\/${escapeRegex(colName)}>`, "i");
-      const valMatch = rowContent.match(valRegex);
-      if (valMatch) {
-        row[colName] = parseValue(valMatch[1]);
-      } else {
-        row[colName] = null;
-      }
-    }
-
-    // If no schema columns found, extract all elements from row
-    if (columnNames.length === 0) {
-      const elemRegex = /<([A-Za-z_][A-Za-z0-9_.]*)(?:\s[^>]*)?>([^<]*)<\/\1>/g;
-      let elemMatch;
-      while ((elemMatch = elemRegex.exec(rowContent)) !== null) {
-        row[elemMatch[1]] = parseValue(elemMatch[2]);
-      }
-    }
-
-    if (Object.keys(row).length > 0) {
-      rows.push(row);
-    }
-  }
-
-  return rows;
-}
-
-function escapeRegex(str: string): string {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function parseValue(val: string): unknown {
-  const trimmed = val.trim();
-  if (trimmed === "true") return true;
-  if (trimmed === "false") return false;
-  if (trimmed === "") return null;
-  // Try number
-  const num = Number(trimmed);
-  if (!isNaN(num) && trimmed.length > 0 && trimmed.length < 20) return num;
-  return trimmed;
+    return result;
+  });
 }
