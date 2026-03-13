@@ -79,7 +79,9 @@ export function renderRuleReport(
   const sorted = [...issues].sort((a, b) => {
     const sd = statusOrder[a.status] - statusOrder[b.status];
     if (sd !== 0) return sd;
-    return sevOrder[a.severity] - sevOrder[b.severity];
+    const sv = sevOrder[a.severity] - sevOrder[b.severity];
+    if (sv !== 0) return sv;
+    return a.id.localeCompare(b.id);
   });
 
   lines.push(
