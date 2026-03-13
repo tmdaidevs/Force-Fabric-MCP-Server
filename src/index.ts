@@ -33,9 +33,13 @@ for (const tool of allTools) {
       case "number":
         zodType = z.number().describe((p.description as string) ?? "");
         break;
-      case "array":
-        zodType = z.array(z.string()).describe((p.description as string) ?? "");
+      case "array": {
+        const items = (p.items as Record<string, unknown> | undefined);
+        const itemType = items?.type;
+        const inner = itemType === "number" ? z.number() : z.string();
+        zodType = z.array(inner).describe((p.description as string) ?? "");
         break;
+      }
       case "object":
         zodType = z.record(z.string(), z.unknown()).describe((p.description as string) ?? "");
         break;

@@ -430,9 +430,11 @@ export async function runTemporaryNotebook(
   let errorMsg: string | undefined;
   const maxPollTime = 5 * 60 * 1000; // 5 minutes
   const startTime = Date.now();
+  let pollInterval = 2000; // Start at 2s, increase with backoff
 
   while (Date.now() - startTime < maxPollTime) {
-    await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5s between polls
+    await new Promise(resolve => setTimeout(resolve, pollInterval));
+    pollInterval = Math.min(pollInterval * 1.5, 15000); // Max 15s between polls
 
     try {
       const status = await fabricFetch<{ status: string; failureReason?: { message: string } }>(

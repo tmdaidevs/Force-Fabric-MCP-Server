@@ -824,11 +824,31 @@ export async function warehouseOptimizationRecommendations(args: {
     recommendation: "Cache results or optimize these high-impact queries.",
   });
 
-  // WH-025: Failed Queries
+  // WH-025: Failed Queries with error categorization
+  const failedRows = rows("failedQueries");
+  let failedDetails = "";
+  if (err("failedQueries")) {
+    failedDetails = err("failedQueries")!;
+  } else if (failedRows.length === 0) {
+    failedDetails = "No recent query failures.";
+  } else {
+    // Categorize failures by status/error pattern
+    const categories = new Map<string, number>();
+    for (const r of failedRows) {
+      const text = ((r.query_text as string) ?? "").substring(0, 50);
+      const cat = text.match(/timeout/i) ? "Timeout" :
+        text.match(/permission|denied|unauthorized/i) ? "Permission" :
+        text.match(/syntax|parse/i) ? "Syntax" :
+        text.match(/deadlock/i) ? "Deadlock" : "Other";
+      categories.set(cat, (categories.get(cat) ?? 0) + 1);
+    }
+    const breakdown = [...categories.entries()].map(([k, v]) => `${k}: ${v}`).join(", ");
+    failedDetails = `${failedRows.length} failure(s) — ${breakdown}`;
+  }
   rules.push({ id: "WH-025", rule: "No Recent Query Failures", category: "Reliability", severity: "MEDIUM",
-    status: err("failedQueries") ? "ERROR" : cnt("failedQueries") === 0 ? "PASS" : "WARN",
-    details: err("failedQueries") ?? (cnt("failedQueries") === 0 ? "No recent query failures." : `${cnt("failedQueries")} recent query failure(s).`),
-    recommendation: "Investigate failed queries to fix errors.",
+    status: err("failedQueries") ? "ERROR" : failedRows.length === 0 ? "PASS" : "WARN",
+    details: failedDetails,
+    recommendation: "Investigate failed queries grouped by error type.",
   });
 
   // WH-026: Database Settings

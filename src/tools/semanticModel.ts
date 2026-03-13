@@ -881,6 +881,9 @@ export async function semanticModelFix(args: {
   const modelDef = (bim as Record<string, unknown>).model as Record<string, unknown> | undefined;
   if (!modelDef) return "❌ No 'model' key found in model.bim.";
 
+  // Keep original payload for rollback if upload fails
+  const originalPayload = bimPart.payload;
+
   const tables = (modelDef.tables ?? []) as Array<Record<string, unknown>>;
   const ruleIds = args.ruleIds ?? ["SM-FIX-FORMAT", "SM-FIX-DESC", "SM-FIX-HIDDEN", "SM-FIX-DATE", "SM-FIX-KEY", "SM-FIX-AUTODATE"];
   let modified = false;
@@ -889,13 +892,26 @@ export async function semanticModelFix(args: {
   for (const ruleId of ruleIds) {
     try {
       if (ruleId === "SM-FIX-FORMAT") {
-        // Add format strings to measures without one
+        // Add format strings to measures without one, inferring type from name/expression
         for (const table of tables) {
           const measures = (table.measures ?? []) as Array<Record<string, unknown>>;
           for (const m of measures) {
             if (!m.formatString && !m.isHidden) {
-              m.formatString = "#,0";
-              results.push(`| SM-FIX-FORMAT | ✅ | Added format to ${table.name}[${m.name}] |`);
+              const name = ((m.name as string) ?? "").toLowerCase();
+              const expr = ((m.expression as string) ?? "").toLowerCase();
+              // Infer format from measure name or expression
+              let fmt = "#,0";
+              if (name.includes("pct") || name.includes("percent") || name.includes("ratio") || name.includes("rate")
+                || expr.includes("divide") && (name.includes("%") || expr.includes("percent"))) {
+                fmt = "0.0%";
+              } else if (name.includes("price") || name.includes("cost") || name.includes("revenue")
+                || name.includes("amount") || name.includes("sales") || name.includes("profit")) {
+                fmt = "$#,##0.00";
+              } else if (name.includes("avg") || name.includes("average") || name.includes("mean")) {
+                fmt = "#,##0.00";
+              }
+              m.formatString = fmt;
+              results.push(`| SM-FIX-FORMAT | ✅ | Added format "${fmt}" to ${table.name}[${m.name}] |`);
               totalFixed++;
               modified = true;
             }
@@ -962,11 +978,22 @@ export async function semanticModelFix(args: {
       }
 
       if (ruleId === "SM-FIX-AUTODATE") {
-        // Remove auto-date tables
+        // Remove auto-date tables (only if no relationships reference them)
+        const relationships = (modelDef.relationships ?? []) as Array<Record<string, unknown>>;
+        const relationshipTargets = new Set([
+          ...relationships.map(r => r.fromTable as string),
+          ...relationships.map(r => r.toTable as string),
+        ]);
         const before = tables.length;
         const filtered = tables.filter(t => {
           const name = t.name as string;
-          return !name.startsWith("DateTableTemplate_") && !name.startsWith("LocalDateTable_");
+          if (!name.startsWith("DateTableTemplate_") && !name.startsWith("LocalDateTable_")) return true;
+          // Keep if any relationship references it
+          if (relationshipTargets.has(name)) {
+            results.push(`| SM-FIX-AUTODATE | ⚪ | Kept ${name} — has relationships |`);
+            return true;
+          }
+          return false;
         });
         const removed = before - filtered.length;
         if (removed > 0) {
@@ -994,7 +1021,16 @@ export async function semanticModelFix(args: {
       results.push(`| UPLOAD | ✅ | Model definition updated successfully |`);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      results.push(`| UPLOAD | ❌ | Failed to update model: ${msg.substring(0, 100)} |`);
+      // Attempt rollback with original payload
+      try {
+        const rollbackParts = parts.map(p =>
+          p.path === bimPart.path ? { ...p, payload: originalPayload } : p
+        );
+        await updateSemanticModelDefinition(args.workspaceId, args.semanticModelId, rollbackParts);
+        results.push(`| UPLOAD | ❌ | Failed: ${msg.substring(0, 80)} (rolled back to original) |`);
+      } catch {
+        results.push(`| UPLOAD | ❌ | Failed: ${msg.substring(0, 80)} (rollback also failed — check model manually) |`);
+      }
       totalFailed++;
     }
   } else {

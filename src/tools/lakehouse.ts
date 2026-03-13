@@ -778,14 +778,20 @@ export async function lakehouseOptimizationRecommendations(args: {
 
     if (workspace) {
       const deltaLogResults: Array<{ table: string; log: DeltaLogAnalysis }> = [];
+      const deltaTableLimit = 20;
+      const skippedDeltaTables = Math.max(0, deltaTables.length - deltaTableLimit);
 
-      for (const t of deltaTables.slice(0, 10)) { // Limit to 10 tables for performance
+      for (const t of deltaTables.slice(0, deltaTableLimit)) {
         try {
           const log = await readDeltaLog(workspace.displayName, lakehouse.displayName, t.name);
           deltaLogResults.push({ table: t.name, log });
         } catch {
           // Skip tables where delta log can't be read
         }
+      }
+
+      if (skippedDeltaTables > 0) {
+        header.push(`> ⚠️ Delta Log analysis limited to ${deltaTableLimit} tables. ${skippedDeltaTables} table(s) skipped.`, "");
       }
 
       if (deltaLogResults.length > 0) {
