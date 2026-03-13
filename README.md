@@ -2,7 +2,7 @@
 
 <p align="center">
   <strong>Detect issues. Auto-fix problems. Optimize your Fabric tenant.</strong><br>
-  An MCP server that scans Lakehouses, Warehouses, Eventhouses, and Semantic Models with 113 rules — and can auto-fix 47 of them.
+  An MCP server that scans Lakehouses, Warehouses, Eventhouses, and Semantic Models with 120 rules — and can auto-fix 45 of them.
 </p>
 
 <p align="center">
@@ -17,25 +17,25 @@
 
 ## ✨ Key Features
 
-### 🔍 Detect — 113 Rules Across 4 Fabric Items
+### 🔍 Detect — 120 Rules Across 4 Fabric Items
 
 | Item | Rules | What's Scanned |
 |------|-------|----------------|
 | 🏠 **Lakehouse** | 29 | SQL Endpoint + OneLake Delta Log (VACUUM history, file sizes, partitioning, retention) |
 | 🏗️ **Warehouse** | 39 | Schema, query performance, security (PII, RLS), database config |
-| 📊 **Eventhouse** | 13/db | Extent fragmentation, caching/retention policies, ingestion failures, query performance |
+| 📊 **Eventhouse** | 20/db | Extent fragmentation, caching/retention/merge/encoding/partitioning policies, ingestion, query performance, materialized views, stored functions |
 | 📐 **Semantic Model** | 32 | DAX expression anti-patterns, model structure, COLUMNSTATISTICS BPA |
-| | **113 total** | |
+| | **120 total** | |
 
-### 🔧 Fix — 47 Auto-Fixable Issues
+### 🔧 Fix — 45 Auto-Fixable Issues
 
 | Item | Auto-Fixes | Method |
 |------|-----------|--------|
 | 🏗️ **Warehouse** | 12 fixes | SQL DDL executed directly |
 | 🏠 **Lakehouse** | 14 fixes | REST API (3) + Notebook Spark SQL (11) |
 | 📐 **Semantic Model** | 12 fixes | model.bim REST API (6) + Notebook sempy (6) |
-| 📊 **Eventhouse** | 3 fixes | KQL management commands |
-| | **41 total** | |
+| 📊 **Eventhouse** | 7 fixes | KQL management commands (with dry-run preview) |
+| | **45 total** | |
 
 ### 📊 Unified Output
 
@@ -153,11 +153,17 @@ Run all safe fixes or specify individual rule IDs:
 
 ### Eventhouse Fixes (`eventhouse_fix`)
 
+Supports **dry-run mode** (`dryRun: true`) to preview commands without executing them.
+
 | Rule ID | What It Fixes | KQL Command |
 |---------|--------------|-------------|
 | EH-002 | Fragmented extents | `.merge table ['name']` |
 | EH-004 | Missing caching policy | `.alter table/database policy caching hot = 30d` |
 | EH-005 | Missing retention policy | `.alter table/database policy retention softdelete = 365d` |
+| EH-006 | Unhealthy materialized views | `.enable materialized-view ['name']` |
+| EH-014 | Missing ingestion batching | `.alter table/database policy ingestionbatching ...` |
+| EH-016 | Large tables without partitioning | `.alter table policy partitioning ...` |
+| EH-017 | Suboptimal merge policy | `.alter table policy merge ...` |
 
 ### Lakehouse Fixes (`lakehouse_run_table_maintenance`)
 
@@ -225,9 +231,9 @@ For fixes that require Spark SQL, the MCP server creates a **temporary Notebook*
 |----------|------|--------|-----|------|-------|----------|
 | 🏠 Lakehouse | 5 | 14 | 9 | 1 | **29** | 14 (3 REST + 11 Notebook) |
 | 🏗️ Warehouse | 8 | 17 | 12 | 0 | **39** | 12 (SQL DDL) |
-| 📊 Eventhouse | 4 | 6 | 0 | 1 | **13** | 3 (KQL) |
+| 📊 Eventhouse | 4 | 7 | 3 | 3 | **20** | 7 (KQL + dry-run) |
 | 📐 Semantic Model | 7 | 14 | 9 | 0 | **32** | 12 (6 model.bim + 6 Notebook) |
-| **Total** | **24** | **51** | **30** | **2** | **113** | **41** |
+| **Total** | **24** | **52** | **33** | **4** | **120** | **45** |
 
 <details>
 <summary><strong>🏠 Lakehouse — 29 Rules</strong> (click to expand)</summary>
@@ -314,7 +320,7 @@ For fixes that require Spark SQL, the MCP server creates a **temporary Notebook*
 </details>
 
 <details>
-<summary><strong>📊 Eventhouse — 13 Rules per KQL Database</strong> (click to expand)</summary>
+<summary><strong>📊 Eventhouse — 20 Rules per KQL Database</strong> (click to expand)</summary>
 
 | # | Rule | Category | Severity | Auto-Fix |
 |---|------|----------|----------|----------|
@@ -323,7 +329,7 @@ For fixes that require Spark SQL, the MCP server creates a **temporary Notebook*
 | EH-003 | Good Compression Ratio | Performance | MEDIUM | — |
 | EH-004 | Caching Policy Configured | Performance | MEDIUM | 🔧 KQL |
 | EH-005 | Retention Policy Configured | Data Management | MEDIUM | 🔧 KQL |
-| EH-006 | Materialized Views Healthy | Reliability | HIGH | — |
+| EH-006 | Materialized Views Healthy | Reliability | HIGH | 🔧 KQL |
 | EH-007 | Data Is Fresh | Data Quality | MEDIUM | — |
 | EH-008 | No Slow Query Patterns | Performance | HIGH | — |
 | EH-009 | No Recent Failed Commands | Reliability | MEDIUM | — |
@@ -331,6 +337,13 @@ For fixes that require Spark SQL, the MCP server creates a **temporary Notebook*
 | EH-011 | Streaming Ingestion Config | Performance | INFO | — |
 | EH-012 | Continuous Exports Healthy | Reliability | MEDIUM | — |
 | EH-013 | Hot Cache Coverage | Performance | MEDIUM | — |
+| EH-014 | Ingestion Batching Configured | Performance | LOW | 🔧 KQL |
+| EH-015 | Update Policies Configured | Data Management | INFO | — |
+| EH-016 | Partitioning on Large Tables | Performance | MEDIUM | 🔧 KQL |
+| EH-017 | Merge Policy Configured | Performance | LOW | 🔧 KQL |
+| EH-018 | Encoding Policy for Poorly Compressed | Performance | MEDIUM | — |
+| EH-019 | Row Order Policy | Performance | LOW | — |
+| EH-020 | Stored Functions Inventory | Data Management | INFO | — |
 
 </details>
 
@@ -395,7 +408,7 @@ src/
     ├── workspace.ts            workspace_list
     ├── lakehouse.ts            29 rules + table maintenance
     ├── warehouse.ts            39 rules + 12 auto-fixes
-    ├── eventhouse.ts           13 rules + 3 auto-fixes
+    ├── eventhouse.ts           20 rules + 7 auto-fixes (with dry-run)
     └── semanticModel.ts        32 rules + 6 auto-fixes (model.bim)
 ```
 
