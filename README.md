@@ -2,42 +2,65 @@
   <img src="banner.png" alt="Force Fabric MCP Server — Detect & Optimize" width="100%">
 </p>
 
-# Force Fabric MCP Server
+<h1 align="center">Force Fabric MCP Server</h1>
 
-A **Model Context Protocol (MCP) server** that provides live optimization analysis for Microsoft Fabric items. It connects to your Fabric tenant via Azure authentication and runs **100+ rules** across Lakehouses, Warehouses, Eventhouses, and Semantic Models — detecting real issues with specific table and column names.
+<p align="center">
+  <strong>Detect issues. Auto-fix problems. Optimize your Fabric tenant.</strong><br>
+  An MCP server that scans Lakehouses, Warehouses, Eventhouses, and Semantic Models with 113 rules — and can auto-fix 47 of them.
+</p>
 
-## Features
+<p align="center">
+  <a href="#-quick-start">Quick Start</a> •
+  <a href="#-detect--scan">Detect</a> •
+  <a href="#-auto-fix">Auto-Fix</a> •
+  <a href="#-rule-reference">Rules</a> •
+  <a href="#-architecture">Architecture</a>
+</p>
 
-### 🏠 Lakehouse Analysis (29 rules)
-- **REST API**: SQL Endpoint status, Delta format check, medallion architecture naming
-- **SQL Endpoint**: Data type analysis, nullable keys, empty tables, wide columns, naming conventions, audit columns, sensitive data
-- **OneLake Delta Log**: VACUUM/OPTIMIZE history, auto-optimize settings, retention policies, file size analysis, write amplification, Z-Order, data skipping, partitioning
+---
 
-### 🏗️ Warehouse Analysis (39 rules)
-- **Schema**: Primary keys, deprecated types, float precision, column/table naming, wide tables, foreign keys, circular FKs
-- **Data Quality**: Nullable keys, empty tables, mixed date types, missing defaults, sensitive/PII columns
-- **Query Performance**: Top slow queries, frequent queries, failed queries, volume trends, average duration
-- **Security**: Data masking, RLS, privilege audit
-- **Database Config**: AUTO_UPDATE_STATISTICS, result set caching, ANSI settings, snapshot isolation, page verify
+## ✨ Key Features
 
-### 📊 Eventhouse Analysis (13 rules per KQL database)
-- **Storage**: Extent fragmentation, compression ratios, storage by table
-- **Policies**: Caching, retention, merge, encoding, row order, partitioning, ingestion batching, streaming
-- **Health**: Materialized views, data freshness, continuous exports, ingestion failures
-- **Queries**: Performance summary (P95/avg/max), slow queries, failed commands
+### 🔍 Detect — 113 Rules Across 4 Fabric Items
 
-### 📐 Semantic Model Analysis (32 rules)
-- **DAX Expression Checks** (via MDSCHEMA_MEASURES DMV): IFERROR, DIVIDE vs /, EVALUATEANDLOG, INTERSECT, duplicates, FILTER patterns, nested CALCULATE, SUMX, 1-(x/y), format strings
-- **Model Structure** (via MDSCHEMA DMVs): Table count, date table, measure documentation, naming
-- **COLUMNSTATISTICS BPA** (Import models): High-cardinality text, GUIDs, constants, boolean/date/number as text, string keys, wide tables, timestamps
+| Item | Rules | What's Scanned |
+|------|-------|----------------|
+| 🏠 **Lakehouse** | 29 | SQL Endpoint + OneLake Delta Log (VACUUM history, file sizes, partitioning, retention) |
+| 🏗️ **Warehouse** | 39 | Schema, query performance, security (PII, RLS), database config |
+| 📊 **Eventhouse** | 13/db | Extent fragmentation, caching/retention policies, ingestion failures, query performance |
+| 📐 **Semantic Model** | 32 | DAX expression anti-patterns, model structure, COLUMNSTATISTICS BPA |
 
-## Setup
+### 🔧 Fix — 47 Auto-Fixable Issues
+
+| Item | Auto-Fixes | Method |
+|------|-----------|--------|
+| 🏗️ **Warehouse** | 12 fixes | SQL DDL executed directly |
+| 📊 **Eventhouse** | 3 fixes | KQL management commands |
+| 🏠 **Lakehouse** | 3 fixes | Fabric REST API (OPTIMIZE, VACUUM, Z-Order) |
+| 📐 **Semantic Model** | 6 fixes | Download model.bim → modify → upload |
+
+### 📊 Unified Output
+
+Every scan returns a clean results table — only issues shown, passed rules counted in summary:
+
+```
+29 rules — ✅ 18 passed | 🔴 1 failed | 🟡 10 warning
+
+| Rule | Status | Finding | Recommendation |
+|------|--------|---------|----------------|
+| LH-007 Key Columns Are NOT NULL | 🔴 | 16 key column(s) allow NULL: table.finding_id, ... | Add NOT NULL constraints |
+| LH-017 Regular VACUUM Executed | 🟡 | 4 table(s) need VACUUM: table1, table2, ... | Run VACUUM weekly |
+```
+
+---
+
+## 🚀 Quick Start
 
 ### Prerequisites
 
 - **Node.js** 18+
-- **Azure CLI** (`az login`) or another Azure authentication method
-- **Fabric capacity** with items (Lakehouse, Warehouse, Eventhouse, or Semantic Model)
+- **Azure CLI** with `az login` completed
+- **Fabric capacity** with items to scan
 
 ### Install
 
@@ -48,9 +71,9 @@ npm install
 npm run build
 ```
 
-### Configure in VS Code
+### Configure VS Code
 
-Add to your `.vscode/mcp.json`:
+Add to `.vscode/mcp.json` in your project:
 
 ```json
 {
@@ -59,262 +82,291 @@ Add to your `.vscode/mcp.json`:
       "type": "stdio",
       "command": "node",
       "args": ["dist/index.js"],
-      "cwd": "${workspaceFolder}"
+      "cwd": "/path/to/Force-Fabric-MCP-Server"
     }
   }
 }
 ```
 
-Or add to your global VS Code settings (`settings.json`):
-
-```json
-{
-  "mcp": {
-    "servers": {
-      "fabric-optimization": {
-        "type": "stdio",
-        "command": "node",
-        "args": ["/absolute/path/to/Force-Fabric-MCP-Server/dist/index.js"]
-      }
-    }
-  }
-}
-```
-
-## Usage
-
-### 1. Authenticate
+### Use
 
 ```
-Use auth_login with method "azure_cli"
+1. "Login to Fabric with azure_cli"
+2. "List all lakehouses in workspace <id>"
+3. "Scan lakehouse <id> in workspace <id>"
+4. "Fix warehouse <id> in workspace <id>"
 ```
 
-Available methods: `azure_cli`, `interactive_browser`, `device_code`, `vscode`, `default`, `service_principal`
+---
 
-### 2. List items
+## 🔍 Detect & Scan
 
-```
-List all lakehouses in workspace <workspace-id>
-List all warehouses in workspace <workspace-id>
-List all eventhouses in workspace <workspace-id>
-List all semantic models in workspace <workspace-id>
-```
+### Available Scan Tools
 
-### 3. Run optimization scan
-
-```
-Run lakehouse optimization recommendations for <lakehouse-id> in workspace <workspace-id>
-Run warehouse optimization recommendations for <warehouse-id> in workspace <workspace-id>
-Run eventhouse optimization recommendations for <eventhouse-id> in workspace <workspace-id>
-Run semantic model optimization recommendations for <model-id> in workspace <workspace-id>
-```
-
-### Output Format
-
-Every scan returns a unified rule results table:
-
-```
-15 rules — ✅ 9 passed | 🔴 1 failed | 🟡 5 warning
-
-| Rule | Status | Finding | Recommendation |
-|------|--------|---------|----------------|
-| LH-007 Key Columns Are NOT NULL | 🔴 | 16 key column(s) allow NULL: ... | Add NOT NULL constraints... |
-| LH-004 Table Maintenance | 🟡 | 4 Delta tables need OPTIMIZE... | Run lakehouse_run_table_maintenance... |
-```
-
-Only issues (FAIL/WARN) are shown in the table. Passed rules are counted in the summary.
-
-## Available Tools
-
-| Tool | Description |
+| Tool | What It Does |
 |------|-------------|
-| `auth_login` | Authenticate to Fabric |
-| `auth_status` | Check authentication status |
-| `auth_logout` | Disconnect |
-| `workspace_list` | List all workspaces |
-| `lakehouse_list` | List lakehouses in a workspace |
-| `lakehouse_list_tables` | List tables in a lakehouse |
-| `lakehouse_run_table_maintenance` | Run OPTIMIZE/VACUUM on tables |
-| `lakehouse_get_job_status` | Check maintenance job status |
-| `lakehouse_optimization_recommendations` | Full scan with 29 rules |
-| `warehouse_list` | List warehouses in a workspace |
-| `warehouse_optimization_recommendations` | Full scan with 39 rules |
-| `warehouse_analyze_query_patterns` | Focused query performance analysis |
-| `eventhouse_list` | List eventhouses in a workspace |
-| `eventhouse_list_kql_databases` | List KQL databases |
-| `eventhouse_optimization_recommendations` | Full scan with 13+ rules per KQL DB |
-| `semantic_model_list` | List semantic models |
-| `semantic_model_optimization_recommendations` | Full scan with 32 rules |
+| `lakehouse_optimization_recommendations` | Scans SQL Endpoint + reads Delta Log files from OneLake |
+| `warehouse_optimization_recommendations` | Connects via SQL and runs 39 diagnostic queries |
+| `warehouse_analyze_query_patterns` | Focused analysis of slow/frequent/failed queries |
+| `eventhouse_optimization_recommendations` | Runs KQL diagnostics on each KQL database |
+| `semantic_model_optimization_recommendations` | Executes DAX + MDSCHEMA DMVs for BPA analysis |
 
-## Complete Rule Reference
+### Data Sources Used
 
-### 🏠 Lakehouse Rules (29)
+```
+                          ┌─────────────────────────────────────┐
+                          │         Fabric REST API             │
+                          │  Workspaces, Items, Metadata        │
+                          └──────────────┬──────────────────────┘
+                                         │
+          ┌──────────────┬───────────────┼───────────────┬──────────────┐
+          ▼              ▼               ▼               ▼              ▼
+   ┌─────────────┐ ┌──────────┐ ┌──────────────┐ ┌──────────┐ ┌──────────────┐
+   │  SQL Client │ │ KQL REST │ │ OneLake ADLS │ │ DAX API  │ │ MDSCHEMA DMV │
+   │  (tedious)  │ │   API    │ │  Gen2 API    │ │executeQry│ │  via REST    │
+   └──────┬──────┘ └────┬─────┘ └──────┬───────┘ └────┬─────┘ └──────┬───────┘
+          │              │              │              │              │
+    Lakehouse SQL   Eventhouse    Delta Log JSON   Semantic     Semantic
+    Warehouse SQL   KQL DBs       File Metadata    Model DAX    Model Meta
+```
 
-| Rule | Category | Severity | Description |
-|------|----------|----------|-------------|
-| LH-001 | Availability | HIGH | SQL Endpoint is active and provisioned |
-| LH-002 | Maintainability | LOW | Lakehouse follows medallion naming (bronze/silver/gold) |
-| LH-003 | Performance | HIGH | All tables use Delta format |
-| LH-004 | Performance | MEDIUM | Delta tables have regular OPTIMIZE + VACUUM |
-| LH-005 | Data Quality | MEDIUM | No empty tables |
-| LH-006 | Performance | MEDIUM | No over-provisioned string columns (>500 chars) |
-| LH-007 | Data Quality | HIGH | Key/ID columns are NOT NULL |
-| LH-008 | Data Quality | MEDIUM | No float/real precision issues |
-| LH-009 | Maintainability | LOW | Column naming convention (no spaces/special chars) |
-| LH-010 | Data Quality | MEDIUM | Date columns use proper DATE/DATETIME2 types |
-| LH-011 | Data Quality | MEDIUM | Numeric columns use proper numeric types |
-| LH-012 | Maintainability | LOW | No excessively wide tables (>30 columns) |
-| LH-013 | Data Quality | MEDIUM | Schema has NOT NULL constraints (not >90% nullable) |
-| LH-014 | Maintainability | LOW | Tables have audit columns (created_at/updated_at) |
-| LH-015 | Data Quality | LOW | Consistent date types per table |
-| LH-S01 | Security | HIGH | No unprotected sensitive/PII columns |
-| LH-S02 | Performance | INFO | Large tables (>1M rows) identified |
-| LH-S03 | Maintainability | HIGH | No deprecated data types (TEXT/NTEXT/IMAGE) |
-| LH-S04 | Data Quality | MEDIUM | All tables have key columns |
-| LH-016 | Performance | MEDIUM | Large tables (>10GB) are partitioned |
-| LH-017 | Maintenance | MEDIUM | Regular VACUUM executed (within 7 days) |
-| LH-018 | Performance | MEDIUM | Regular OPTIMIZE executed |
-| LH-019 | Performance | HIGH | No small file problem (>50% files <25MB) |
-| LH-020 | Performance | MEDIUM | Auto-optimize enabled |
-| LH-021 | Maintenance | LOW | Retention policy configured |
-| LH-022 | Performance | LOW | Delta log version count reasonable (<100) |
-| LH-023 | Performance | MEDIUM | Low write amplification (MERGE/UPDATE/DELETE ratio) |
-| LH-024 | Performance | LOW | Data skipping configured |
-| LH-025 | Performance | MEDIUM | Z-Order applied on large tables (>10GB) |
+---
 
-### 🏗️ Warehouse Rules (39)
+## 🔧 Auto-Fix
 
-| Rule | Category | Severity | Description |
-|------|----------|----------|-------------|
-| WH-001 | Data Quality | HIGH | Primary keys defined (NOT ENFORCED) |
-| WH-002 | Maintainability | HIGH | No deprecated data types (TEXT/NTEXT/IMAGE) |
-| WH-003 | Data Quality | MEDIUM | No float/real precision issues |
-| WH-004 | Performance | MEDIUM | No over-provisioned columns (>500 chars) |
-| WH-005 | Maintainability | LOW | Column naming convention |
-| WH-006 | Maintainability | LOW | Table naming convention |
-| WH-007 | Maintainability | LOW | No SELECT * in views |
-| WH-008 | Performance | MEDIUM | Statistics are fresh (<30 days) |
-| WH-009 | Data Quality | MEDIUM | No disabled/untrusted constraints |
-| WH-010 | Data Quality | HIGH | Key columns are NOT NULL |
-| WH-011 | Maintainability | MEDIUM | No empty tables |
-| WH-012 | Maintainability | MEDIUM | No excessively wide tables (>50 columns) |
-| WH-013 | Data Quality | LOW | Consistent date types per table |
-| WH-014 | Maintainability | MEDIUM | Foreign keys defined |
-| WH-015 | Performance | MEDIUM | No large BLOB/MAX columns |
-| WH-016 | Maintainability | LOW | Tables have audit columns |
-| WH-017 | Data Quality | HIGH | No circular foreign keys |
-| WH-018 | Security | HIGH | Sensitive data protected (PII masking) |
-| WH-019 | Security | MEDIUM | Row-Level Security defined |
-| WH-020 | Security | MEDIUM | Minimal db_owner privileges |
-| WH-021 | Maintainability | LOW | No over-complex views (>10 dependencies) |
-| WH-022 | Maintainability | LOW | Minimal cross-schema dependencies |
-| WH-023 | Performance | HIGH | No very slow queries (>60s) |
-| WH-024 | Performance | HIGH | No frequently slow queries (>10x and >10s avg) |
-| WH-025 | Reliability | MEDIUM | No recent query failures |
-| WH-026 | Performance | HIGH | AUTO_UPDATE_STATISTICS enabled |
-| WH-027 | Performance | MEDIUM | Result set caching enabled |
-| WH-028 | Concurrency | MEDIUM | Snapshot isolation enabled |
-| WH-029 | Reliability | MEDIUM | Page verify CHECKSUM |
-| WH-030 | Standards | LOW | ANSI settings correct |
-| WH-031 | Availability | HIGH | Database ONLINE |
-| WH-032 | Performance | MEDIUM | All tables have statistics |
-| WH-033 | Performance | MEDIUM | Optimal data types |
-| WH-034 | Maintainability | LOW | No near-empty tables (<10 rows) |
-| WH-035 | Maintainability | LOW | Stored procedures documented |
-| WH-036 | Data Quality | MEDIUM | NOT NULL columns have defaults |
-| WH-037 | Maintainability | LOW | Consistent string types (varchar/nvarchar) |
-| WH-038 | Maintainability | LOW | Schemas are documented |
-| WH-039 | Performance | MEDIUM | Query performance healthy (avg <5s) |
+### Warehouse Fixes (`warehouse_fix`)
 
-### 📊 Eventhouse Rules (13 per KQL Database)
+Run all safe fixes or specify individual rule IDs:
 
-| Rule | Category | Severity | Description |
-|------|----------|----------|-------------|
-| EH-001 | Availability | HIGH | Query endpoint available |
-| EH-002 | Performance | HIGH | No extent fragmentation |
-| EH-003 | Performance | MEDIUM | Good compression ratio (>40%) |
-| EH-004 | Performance | MEDIUM | Caching policy configured |
-| EH-005 | Data Management | MEDIUM | Retention policy configured |
-| EH-006 | Reliability | HIGH | Materialized views healthy |
-| EH-007 | Data Quality | MEDIUM | Data is fresh (<7 days) |
-| EH-008 | Performance | HIGH | No slow query patterns (>30s avg) |
-| EH-009 | Reliability | MEDIUM | No recent failed commands |
-| EH-010 | Reliability | HIGH | No ingestion failures |
-| EH-011 | Performance | INFO | Streaming ingestion config |
-| EH-012 | Reliability | MEDIUM | Continuous exports healthy |
-| EH-013 | Performance | MEDIUM | Hot cache coverage (>50% hot) |
+| Rule ID | What It Fixes | SQL Command |
+|---------|--------------|-------------|
+| WH-001 | Missing primary keys | `ALTER TABLE ADD CONSTRAINT PK NOT ENFORCED` |
+| WH-008 | Stale statistics (>30 days) | `UPDATE STATISTICS [table]` |
+| WH-009 | Disabled constraints | `ALTER TABLE WITH CHECK CHECK CONSTRAINT ALL` |
+| WH-016 | Missing audit columns | `ALTER TABLE ADD created_at DATETIME2 DEFAULT GETDATE()` |
+| WH-018 | Unmasked sensitive data | `ALTER COLUMN ADD MASKED WITH (FUNCTION='...')` |
+| WH-026 | Auto-update statistics off | `ALTER DATABASE SET AUTO_UPDATE_STATISTICS ON` |
+| WH-027 | Result set caching off | `ALTER DATABASE SET RESULT_SET_CACHING ON` |
+| WH-028 | Snapshot isolation off | `ALTER DATABASE SET ALLOW_SNAPSHOT_ISOLATION ON` |
+| WH-029 | Page verify not CHECKSUM | `ALTER DATABASE SET PAGE_VERIFY CHECKSUM` |
+| WH-030 | ANSI settings off | `ALTER DATABASE SET ANSI_NULLS ON; ...` |
+| WH-032 | Missing statistics | `UPDATE STATISTICS [table]` |
+| WH-036 | NOT NULL without defaults | `ALTER TABLE ADD DEFAULT ... FOR column` |
 
-### 📐 Semantic Model Rules (32)
+### Eventhouse Fixes (`eventhouse_fix`)
 
-| Rule | Category | Severity | Description |
-|------|----------|----------|-------------|
-| SM-001 | DAX | MEDIUM | Avoid IFERROR function |
-| SM-002 | DAX | MEDIUM | Use DIVIDE function instead of / |
-| SM-003 | DAX | HIGH | No EVALUATEANDLOG in production |
-| SM-004 | DAX | MEDIUM | Use TREATAS not INTERSECT |
-| SM-005 | DAX | LOW | No duplicate measure definitions |
-| SM-006 | DAX | MEDIUM | Filter by columns not tables |
-| SM-007 | DAX | LOW | Avoid adding 0 to measures |
-| SM-008 | Maintenance | LOW | Measures have documentation |
-| SM-009 | Maintenance | HIGH | Model has tables |
-| SM-010 | Performance | MEDIUM | Model has date table |
-| SM-011 | DAX | MEDIUM | Avoid 1-(x/y) syntax |
-| SM-012 | DAX | LOW | No direct measure references |
-| SM-013 | DAX | MEDIUM | Avoid nested CALCULATE |
-| SM-014 | DAX | LOW | Use SUM instead of SUMX for simple aggregation |
-| SM-015 | Formatting | LOW | Measures have format string |
-| SM-016 | DAX | MEDIUM | Avoid FILTER(ALL(...)) |
-| SM-017 | Formatting | LOW | Measure naming convention |
-| SM-018 | Performance | LOW | Reasonable table count (<20) |
-| SM-B01 | Data Types | HIGH | No high cardinality text columns |
-| SM-B02 | Data Types | HIGH | No description/comment columns |
-| SM-B03 | Data Types | HIGH | No GUID/UUID columns in model |
-| SM-B04 | Data Types | MEDIUM | No constant columns (cardinality=1) |
-| SM-B05 | Data Types | MEDIUM | No booleans stored as text |
-| SM-B06 | Data Types | MEDIUM | No dates stored as text |
-| SM-B07 | Data Types | MEDIUM | No numbers stored as text |
-| SM-B08 | Data Types | MEDIUM | Integer keys instead of string keys |
-| SM-B09 | Data Types | MEDIUM | No excessively wide tables |
-| SM-B10 | Data Types | HIGH | No extremely wide tables (>100 cols) |
-| SM-B11 | Data Types | HIGH | No multiple high-cardinality columns |
-| SM-B12 | Data Types | LOW | No single column tables |
-| SM-B13 | Data Types | MEDIUM | No high-precision timestamps |
-| SM-B14 | Data Types | LOW | No low cardinality columns in fact tables |
+| Rule ID | What It Fixes | KQL Command |
+|---------|--------------|-------------|
+| EH-002 | Fragmented extents | `.merge table ['name']` |
+| EH-004 | Missing caching policy | `.alter table/database policy caching hot = 30d` |
+| EH-005 | Missing retention policy | `.alter table/database policy retention softdelete = 365d` |
 
-## Architecture
+### Lakehouse Fixes (`lakehouse_run_table_maintenance`)
+
+| Fix | Parameters |
+|-----|-----------|
+| OPTIMIZE with V-Order | `optimizeSettings: { vOrder: true }` |
+| Z-Order by columns | `optimizeSettings: { zOrderColumns: ["col1", "col2"] }` |
+| VACUUM stale files | `vacuumSettings: { retentionPeriod: "7.00:00:00" }` |
+
+### Semantic Model Fixes (`semantic_model_fix`)
+
+Downloads model.bim, applies modifications, uploads back:
+
+| Fix ID | What It Fixes |
+|--------|--------------|
+| SM-FIX-FORMAT | Add format strings to measures without one |
+| SM-FIX-DESC | Add descriptions to visible tables |
+| SM-FIX-HIDDEN | Set IsAvailableInMDX=false on hidden columns |
+| SM-FIX-DATE | Mark date/calendar tables as Date table |
+| SM-FIX-KEY | Set IsKey=true on PK columns in relationships |
+| SM-FIX-AUTODATE | Remove auto-date tables |
+
+---
+
+## 📋 Rule Reference
+
+<details>
+<summary><strong>🏠 Lakehouse — 29 Rules</strong> (click to expand)</summary>
+
+| # | Rule | Category | Severity | Auto-Fix |
+|---|------|----------|----------|----------|
+| LH-001 | SQL Endpoint Active | Availability | HIGH | — |
+| LH-002 | Medallion Architecture Naming | Maintainability | LOW | — |
+| LH-003 | All Tables Use Delta Format | Performance | HIGH | — |
+| LH-004 | Table Maintenance Recommended | Performance | MEDIUM | 🔧 REST API |
+| LH-005 | No Empty Tables | Data Quality | MEDIUM | — |
+| LH-006 | No Over-Provisioned String Columns | Performance | MEDIUM | — |
+| LH-007 | Key Columns Are NOT NULL | Data Quality | HIGH | — |
+| LH-008 | No Float/Real Precision Issues | Data Quality | MEDIUM | — |
+| LH-009 | Column Naming Convention | Maintainability | LOW | — |
+| LH-010 | Date Columns Use Proper Types | Data Quality | MEDIUM | — |
+| LH-011 | Numeric Columns Use Proper Types | Data Quality | MEDIUM | — |
+| LH-012 | No Excessively Wide Tables | Maintainability | LOW | — |
+| LH-013 | Schema Has NOT NULL Constraints | Data Quality | MEDIUM | — |
+| LH-014 | Tables Have Audit Columns | Maintainability | LOW | — |
+| LH-015 | Consistent Date Types Per Table | Data Quality | LOW | — |
+| LH-S01 | No Unprotected Sensitive Data | Security | HIGH | — |
+| LH-S02 | Large Tables Identified | Performance | INFO | — |
+| LH-S03 | No Deprecated Data Types | Maintainability | HIGH | — |
+| LH-S04 | All Tables Have Key Columns | Data Quality | MEDIUM | — |
+| LH-016 | Large Tables Are Partitioned | Performance | MEDIUM | — |
+| LH-017 | Regular VACUUM Executed | Maintenance | MEDIUM | 🔧 REST API |
+| LH-018 | Regular OPTIMIZE Executed | Performance | MEDIUM | 🔧 REST API |
+| LH-019 | No Small File Problem | Performance | HIGH | 🔧 REST API |
+| LH-020 | Auto-Optimize Enabled | Performance | MEDIUM | — |
+| LH-021 | Retention Policy Configured | Maintenance | LOW | — |
+| LH-022 | Delta Log Version Count Reasonable | Performance | LOW | — |
+| LH-023 | Low Write Amplification | Performance | MEDIUM | — |
+| LH-024 | Data Skipping Configured | Performance | LOW | — |
+| LH-025 | Z-Order on Large Tables | Performance | MEDIUM | 🔧 REST API |
+
+</details>
+
+<details>
+<summary><strong>🏗️ Warehouse — 39 Rules</strong> (click to expand)</summary>
+
+| # | Rule | Category | Severity | Auto-Fix |
+|---|------|----------|----------|----------|
+| WH-001 | Primary Keys Defined | Data Quality | HIGH | 🔧 SQL |
+| WH-002 | No Deprecated Data Types | Maintainability | HIGH | — |
+| WH-003 | No Float/Real Precision Issues | Data Quality | MEDIUM | — |
+| WH-004 | No Over-Provisioned Columns | Performance | MEDIUM | — |
+| WH-005 | Column Naming Convention | Maintainability | LOW | — |
+| WH-006 | Table Naming Convention | Maintainability | LOW | — |
+| WH-007 | No SELECT * in Views | Maintainability | LOW | — |
+| WH-008 | Statistics Are Fresh | Performance | MEDIUM | 🔧 SQL |
+| WH-009 | No Disabled Constraints | Data Quality | MEDIUM | 🔧 SQL |
+| WH-010 | Key Columns Are NOT NULL | Data Quality | HIGH | — |
+| WH-011 | No Empty Tables | Maintainability | MEDIUM | — |
+| WH-012 | No Excessively Wide Tables | Maintainability | MEDIUM | — |
+| WH-013 | Consistent Date Types | Data Quality | LOW | — |
+| WH-014 | Foreign Keys Defined | Maintainability | MEDIUM | — |
+| WH-015 | No Large BLOB Columns | Performance | MEDIUM | — |
+| WH-016 | Tables Have Audit Columns | Maintainability | LOW | 🔧 SQL |
+| WH-017 | No Circular Foreign Keys | Data Quality | HIGH | — |
+| WH-018 | Sensitive Data Protected | Security | HIGH | 🔧 SQL |
+| WH-019 | Row-Level Security | Security | MEDIUM | — |
+| WH-020 | Minimal db_owner Privileges | Security | MEDIUM | — |
+| WH-021 | No Over-Complex Views | Maintainability | LOW | — |
+| WH-022 | Minimal Cross-Schema Dependencies | Maintainability | LOW | — |
+| WH-023 | No Very Slow Queries | Performance | HIGH | — |
+| WH-024 | No Frequently Slow Queries | Performance | HIGH | — |
+| WH-025 | No Recent Query Failures | Reliability | MEDIUM | — |
+| WH-026 | AUTO_UPDATE_STATISTICS Enabled | Performance | HIGH | 🔧 SQL |
+| WH-027 | Result Set Caching Enabled | Performance | MEDIUM | 🔧 SQL |
+| WH-028 | Snapshot Isolation Enabled | Concurrency | MEDIUM | 🔧 SQL |
+| WH-029 | Page Verify CHECKSUM | Reliability | MEDIUM | 🔧 SQL |
+| WH-030 | ANSI Settings Correct | Standards | LOW | 🔧 SQL |
+| WH-031 | Database ONLINE | Availability | HIGH | — |
+| WH-032 | All Tables Have Statistics | Performance | MEDIUM | 🔧 SQL |
+| WH-033 | Optimal Data Types | Performance | MEDIUM | — |
+| WH-034 | No Near-Empty Tables | Maintainability | LOW | — |
+| WH-035 | Stored Procedures Documented | Maintainability | LOW | — |
+| WH-036 | NOT NULL Columns Have Defaults | Data Quality | MEDIUM | 🔧 SQL |
+| WH-037 | Consistent String Types | Maintainability | LOW | — |
+| WH-038 | Schemas Are Documented | Maintainability | LOW | — |
+| WH-039 | Query Performance Healthy | Performance | MEDIUM | — |
+
+</details>
+
+<details>
+<summary><strong>📊 Eventhouse — 13 Rules per KQL Database</strong> (click to expand)</summary>
+
+| # | Rule | Category | Severity | Auto-Fix |
+|---|------|----------|----------|----------|
+| EH-001 | Query Endpoint Available | Availability | HIGH | — |
+| EH-002 | No Extent Fragmentation | Performance | HIGH | 🔧 KQL |
+| EH-003 | Good Compression Ratio | Performance | MEDIUM | — |
+| EH-004 | Caching Policy Configured | Performance | MEDIUM | 🔧 KQL |
+| EH-005 | Retention Policy Configured | Data Management | MEDIUM | 🔧 KQL |
+| EH-006 | Materialized Views Healthy | Reliability | HIGH | — |
+| EH-007 | Data Is Fresh | Data Quality | MEDIUM | — |
+| EH-008 | No Slow Query Patterns | Performance | HIGH | — |
+| EH-009 | No Recent Failed Commands | Reliability | MEDIUM | — |
+| EH-010 | No Ingestion Failures | Reliability | HIGH | — |
+| EH-011 | Streaming Ingestion Config | Performance | INFO | — |
+| EH-012 | Continuous Exports Healthy | Reliability | MEDIUM | — |
+| EH-013 | Hot Cache Coverage | Performance | MEDIUM | — |
+
+</details>
+
+<details>
+<summary><strong>📐 Semantic Model — 32 Rules</strong> (click to expand)</summary>
+
+| # | Rule | Category | Severity | Auto-Fix |
+|---|------|----------|----------|----------|
+| SM-001 | Avoid IFERROR Function | DAX | MEDIUM | — |
+| SM-002 | Use DIVIDE Function | DAX | MEDIUM | — |
+| SM-003 | No EVALUATEANDLOG in Production | DAX | HIGH | — |
+| SM-004 | Use TREATAS not INTERSECT | DAX | MEDIUM | — |
+| SM-005 | No Duplicate Measure Definitions | DAX | LOW | — |
+| SM-006 | Filter by Columns Not Tables | DAX | MEDIUM | — |
+| SM-007 | Avoid Adding 0 to Measures | DAX | LOW | — |
+| SM-008 | Measures Have Documentation | Maintenance | LOW | 🔧 model.bim |
+| SM-009 | Model Has Tables | Maintenance | HIGH | — |
+| SM-010 | Model Has Date Table | Performance | MEDIUM | 🔧 model.bim |
+| SM-011 | Avoid 1-(x/y) Syntax | DAX | MEDIUM | — |
+| SM-012 | No Direct Measure References | DAX | LOW | — |
+| SM-013 | Avoid Nested CALCULATE | DAX | MEDIUM | — |
+| SM-014 | Use SUM Instead of SUMX | DAX | LOW | — |
+| SM-015 | Measures Have Format String | Formatting | LOW | 🔧 model.bim |
+| SM-016 | Avoid FILTER(ALL(...)) | DAX | MEDIUM | — |
+| SM-017 | Measure Naming Convention | Formatting | LOW | — |
+| SM-018 | Reasonable Table Count | Performance | LOW | — |
+| SM-B01 | No High Cardinality Text Columns | Data Types | HIGH | — |
+| SM-B02 | No Description/Comment Columns | Data Types | HIGH | — |
+| SM-B03 | No GUID/UUID Columns | Data Types | HIGH | — |
+| SM-B04 | No Constant Columns | Data Types | MEDIUM | — |
+| SM-B05 | No Booleans Stored as Text | Data Types | MEDIUM | — |
+| SM-B06 | No Dates Stored as Text | Data Types | MEDIUM | — |
+| SM-B07 | No Numbers Stored as Text | Data Types | MEDIUM | — |
+| SM-B08 | Integer Keys Not String Keys | Data Types | MEDIUM | — |
+| SM-B09 | No Excessively Wide Tables | Data Types | MEDIUM | — |
+| SM-B10 | No Extremely Wide Tables | Data Types | HIGH | — |
+| SM-B11 | No Multiple High-Cardinality Columns | Data Types | HIGH | — |
+| SM-B12 | No Single Column Tables | Data Types | LOW | — |
+| SM-B13 | No High-Precision Timestamps | Data Types | MEDIUM | — |
+| SM-B14 | No Low Cardinality in Fact Tables | Data Types | LOW | — |
+
+</details>
+
+---
+
+## 🏗️ Architecture
 
 ```
 src/
-├── index.ts                 # MCP server entry point
+├── index.ts                    MCP server entry point (stdio transport)
 ├── auth/
-│   └── fabricAuth.ts        # Azure authentication (CLI, browser, device code, SP)
+│   └── fabricAuth.ts           Azure auth (CLI, browser, device code, SP)
 ├── clients/
-│   ├── fabricClient.ts      # Fabric REST API + DAX executeQueries
-│   ├── sqlClient.ts         # SQL endpoint via tedious (Lakehouse + Warehouse)
-│   ├── kqlClient.ts         # KQL/Kusto REST API (Eventhouse)
-│   ├── onelakeClient.ts     # OneLake ADLS Gen2 + Delta Log parser
-│   └── xmlaClient.ts        # XMLA SOAP client (experimental)
+│   ├── fabricClient.ts         Fabric REST API + DAX + model.bim CRUD
+│   ├── sqlClient.ts            SQL via tedious (Lakehouse + Warehouse)
+│   ├── kqlClient.ts            KQL/Kusto REST API (Eventhouse)
+│   ├── onelakeClient.ts        OneLake ADLS Gen2 + Delta Log parser
+│   └── xmlaClient.ts           XMLA SOAP client (experimental)
 └── tools/
-    ├── ruleEngine.ts        # Shared RuleResult type + unified renderer
-    ├── auth.ts              # Auth tools
-    ├── workspace.ts         # Workspace tools
-    ├── lakehouse.ts         # 29 rules (REST + SQL + Delta Log)
-    ├── warehouse.ts         # 39 rules (SQL)
-    ├── eventhouse.ts        # 13 rules per KQL DB (KQL)
-    └── semanticModel.ts     # 32 rules (DAX + DMV + COLUMNSTATISTICS)
+    ├── ruleEngine.ts           Shared RuleResult type + unified renderer
+    ├── auth.ts                 auth_login, auth_status, auth_logout
+    ├── workspace.ts            workspace_list
+    ├── lakehouse.ts            29 rules + table maintenance
+    ├── warehouse.ts            39 rules + 12 auto-fixes
+    ├── eventhouse.ts           13 rules + 3 auto-fixes
+    └── semanticModel.ts        32 rules + 6 auto-fixes (model.bim)
 ```
 
-## Authentication Methods
+## 🔐 Authentication
 
 | Method | Use Case |
 |--------|----------|
-| `azure_cli` | Development - uses your az login session |
+| `azure_cli` | **Recommended** — uses your `az login` session |
 | `interactive_browser` | Opens browser for interactive login |
 | `device_code` | Headless/remote environments |
 | `vscode` | Uses VS Code Azure account |
-| `service_principal` | CI/CD and automation (requires tenantId, clientId, clientSecret) |
-| `default` | Auto-detect (tries CLI, managed identity, env vars, VS Code) |
+| `service_principal` | CI/CD (requires tenantId, clientId, clientSecret) |
+| `default` | Auto-detect best available method |
 
-## License
+## 📄 License
 
 MIT
