@@ -10,6 +10,42 @@ import type { FabricEventhouse } from "../clients/fabricClient.js";
 import type { KqlRow } from "../clients/kqlClient.js";
 
 // ──────────────────────────────────────────────
+// Input validation — prevent KQL injection
+// ──────────────────────────────────────────────
+
+const SAFE_KQL_NAME = /^[a-zA-Z0-9_\- .]+$/;
+
+function validateKqlName(value: string, label: string): void {
+  if (!SAFE_KQL_NAME.test(value)) {
+    throw new Error(`Invalid ${label}: must be alphanumeric/underscore/dash/dot only.`);
+  }
+}
+
+// ──────────────────────────────────────────────
+// Policy parsing helpers — normalise across Kusto API versions
+// ──────────────────────────────────────────────
+
+function policyString(row: KqlRow, ...keys: string[]): string {
+  for (const k of keys) {
+    const v = row[k];
+    if (v !== undefined && v !== null && v !== "") {
+      return typeof v === "string" ? v : JSON.stringify(v);
+    }
+  }
+  return "";
+}
+
+function isTruthy(val: unknown): boolean {
+  if (typeof val === "boolean") return val;
+  return String(val).toLowerCase() === "true";
+}
+
+function isFalsy(val: unknown): boolean {
+  if (typeof val === "boolean") return !val;
+  return String(val).toLowerCase() === "false";
+}
+
+// ──────────────────────────────────────────────
 // Tool: eventhouse_list
 // ──────────────────────────────────────────────
 
@@ -279,9 +315,8 @@ function analyzeCachingPolicy(dbPolicy: KqlRow[], tablePolicies: KqlRow[]): stri
   const lines: string[] = [];
 
   if (dbPolicy.length > 0) {
-    const policy = dbPolicy[0];
-    const hotCache = policy.Policy ?? policy.CachingPolicy ?? JSON.stringify(policy);
-    lines.push(`**Database caching policy**: ${typeof hotCache === 'string' ? hotCache : JSON.stringify(hotCache)}`);
+    const hotCache = policyString(dbPolicy[0], "Policy", "CachingPolicy", "CachingPolicyObject");
+    lines.push(`**Database caching policy**: ${hotCache || JSON.stringify(dbPolicy[0])}`);
   }
 
   if (tablePolicies.length > 0) {
@@ -289,9 +324,10 @@ function analyzeCachingPolicy(dbPolicy: KqlRow[], tablePolicies: KqlRow[]): stri
     lines.push("| Table | Policy |");
     lines.push("|-------|--------|");
     for (const t of tablePolicies) {
-      const policy = t.Policy ?? t.CachingPolicy ?? "";
+      const policy = policyString(t, "Policy", "CachingPolicy");
       if (policy) {
-        lines.push(`| ${t.EntityName ?? t.TableName ?? "?"} | ${typeof policy === 'string' ? policy : JSON.stringify(policy)} |`);
+        const name = t.EntityName ?? t.TableName ?? "?";
+        lines.push(`| ${name} | ${policy} |`);
       }
     }
   }
@@ -318,7 +354,7 @@ function analyzeMaterializedViews(rows: KqlRow[]): string[] {
     const autoUpdate = r.AutoUpdateDefinition ?? "?";
     lines.push(`| ${name} | ${source} | ${healthy} | ${autoUpdate} |`);
 
-    if (healthy === false || healthy === "False") {
+    if (isFalsy(healthy)) {
       unhealthy.push(String(name));
     }
   }
@@ -436,7 +472,7 @@ export async function eventhouseOptimizationRecommendations(args: {
 
     // EH-006: Materialized Views Health
     const matViews = kqlRows("materializedViews");
-    const unhealthyViews = matViews.filter(v => v.IsHealthy === false || v.IsHealthy === "False");
+    const unhealthyViews = matViews.filter(v => isFalsy(v.IsHealthy));
     rules.push({
       id: "EH-006", rule: `${pre}Materialized Views Healthy`, category: "Reliability", severity: "HIGH",
       status: err("materializedViews") ? "ERROR" : matViews.length === 0 ? "N/A" : unhealthyViews.length === 0 ? "PASS" : "FAIL",
@@ -485,8 +521,7 @@ export async function eventhouseOptimizationRecommendations(args: {
 
     // EH-011: Streaming Ingestion
     const streamingEnabled = kqlRows("streamingIngestion").filter(x => {
-      const p = x.Policy ?? x.StreamingIngestionPolicy ?? "";
-      const ps = typeof p === 'string' ? p : JSON.stringify(p);
+      const ps = policyString(x, "Policy", "StreamingIngestionPolicy");
       return ps.includes("true") || ps.includes("Enabled");
     });
     rules.push({
@@ -516,6 +551,104 @@ export async function eventhouseOptimizationRecommendations(args: {
       details: err("tableDetails") ?? (coldTables.length === 0 ? "All data within hot cache." : `${coldTables.length} table(s) with >50% cold data.`),
       recommendation: "Extend caching policy for frequently queried tables.",
     });
+
+    // EH-014: Ingestion Batching Policy
+    const batchingRows = kqlRows("ingestionBatching");
+    const noBatching = batchingRows.filter(x => {
+      const ps = policyString(x, "Policy", "IngestionBatchingPolicy");
+      return !ps || ps === "null" || ps === "{}";
+    });
+    rules.push({
+      id: "EH-014", rule: `${pre}Ingestion Batching Configured`, category: "Performance", severity: "LOW",
+      status: err("ingestionBatching") ? "ERROR" : batchingRows.length === 0 ? "N/A" : noBatching.length === 0 ? "PASS" : "WARN",
+      details: err("ingestionBatching") ?? (batchingRows.length === 0 ? "No tables found." : noBatching.length === 0 ? "All tables have explicit batching policies." : `${noBatching.length} table(s) using default batching policy.`),
+      recommendation: "Configure ingestion batching for high-throughput tables to balance latency vs. efficiency.",
+    });
+
+    // EH-015: Update Policies
+    const updatePolicyRows = kqlRows("updatePolicies");
+    const tablesWithUpdate = updatePolicyRows.filter(x => {
+      const ps = policyString(x, "Policy", "UpdatePolicy");
+      return ps && ps !== "null" && ps !== "[]" && ps !== "";
+    });
+    rules.push({
+      id: "EH-015", rule: `${pre}Update Policies Configured`, category: "Data Management", severity: "INFO",
+      status: err("updatePolicies") ? "ERROR" : "PASS",
+      details: err("updatePolicies") ?? (tablesWithUpdate.length > 0 ? `${tablesWithUpdate.length} table(s) with update policies for event-driven transformations.` : "No update policies configured — consider using them for ETL within the database."),
+    });
+
+    // EH-016: Partitioning Policies
+    const partitionRows = kqlRows("partitioningPolicies");
+    const tablesWithPartition = partitionRows.filter(x => {
+      const ps = policyString(x, "Policy", "PartitioningPolicy");
+      return ps && ps !== "null" && ps !== "{}" && ps !== "";
+    });
+    const largeTables = kqlRows("extentStats").filter(x => (x.TotalOriginalSizeMB as number) > 1024);
+    const largeWithoutPartition = largeTables.filter(lt => {
+      const tbl = lt.TableName as string;
+      return !tablesWithPartition.some(p => (p.EntityName ?? p.TableName) === tbl);
+    });
+    rules.push({
+      id: "EH-016", rule: `${pre}Partitioning on Large Tables`, category: "Performance", severity: "MEDIUM",
+      status: err("partitioningPolicies") ? "ERROR" : largeWithoutPartition.length === 0 ? "PASS" : "WARN",
+      details: err("partitioningPolicies") ?? (largeWithoutPartition.length === 0 ? "All large tables (>1 GB) have partitioning policies." : `${largeWithoutPartition.length} large table(s) without partitioning: ${largeWithoutPartition.slice(0, 3).map(x => x.TableName).join(", ")}`),
+      recommendation: "Add partitioning policy on large tables to improve query performance on filtered columns.",
+    });
+
+    // EH-017: Merge Policy
+    const mergeRows = kqlRows("mergePolicy");
+    const customMerge = mergeRows.filter(x => {
+      const ps = policyString(x, "Policy", "MergePolicy");
+      return ps && ps !== "null" && ps !== "{}" && ps !== "";
+    });
+    rules.push({
+      id: "EH-017", rule: `${pre}Merge Policy Configured`, category: "Performance", severity: "LOW",
+      status: err("mergePolicy") ? "ERROR" : "PASS",
+      details: err("mergePolicy") ?? (customMerge.length > 0 ? `${customMerge.length} table(s) with custom merge policies.` : "All tables using default merge policy."),
+      recommendation: "Custom merge policies can optimize compaction for tables with specific ingestion patterns.",
+    });
+
+    // EH-018: Encoding Policy
+    const encodingRows = kqlRows("encodingPolicy");
+    const customEncoding = encodingRows.filter(x => {
+      const ps = policyString(x, "Policy", "EncodingPolicy");
+      return ps && ps !== "null" && ps !== "{}" && ps !== "";
+    });
+    const poorCompTables = kqlRows("columnStats").filter(x =>
+      typeof x.CompressionRatio === "number" && x.CompressionRatio < 40 && (x.TotalOriginalMB as number) > 100
+    );
+    const poorCompNoEncoding = poorCompTables.filter(pt => {
+      const tbl = pt.TableName as string;
+      return !customEncoding.some(e => (e.EntityName ?? e.TableName) === tbl);
+    });
+    rules.push({
+      id: "EH-018", rule: `${pre}Encoding Policy for Poorly Compressed Tables`, category: "Performance", severity: "MEDIUM",
+      status: err("encodingPolicy") ? "ERROR" : poorCompNoEncoding.length === 0 ? "PASS" : "WARN",
+      details: err("encodingPolicy") ?? (poorCompNoEncoding.length === 0 ? "All poorly compressed tables have encoding policies or compression is adequate." : `${poorCompNoEncoding.length} poorly compressed table(s) without encoding policy: ${poorCompNoEncoding.slice(0, 3).map(x => x.TableName).join(", ")}`),
+      recommendation: "Set encoding policy to optimize compression for string-heavy or high-cardinality columns.",
+    });
+
+    // EH-019: Row Order Policy
+    const rowOrderRows = kqlRows("rowOrderPolicy");
+    const tablesWithRowOrder = rowOrderRows.filter(x => {
+      const ps = policyString(x, "Policy", "RowOrderPolicy");
+      return ps && ps !== "null" && ps !== "[]" && ps !== "";
+    });
+    rules.push({
+      id: "EH-019", rule: `${pre}Row Order Policy`, category: "Performance", severity: "LOW",
+      status: err("rowOrderPolicy") ? "ERROR" : "PASS",
+      details: err("rowOrderPolicy") ?? (tablesWithRowOrder.length > 0 ? `${tablesWithRowOrder.length} table(s) with row order policies for optimized queries.` : "No row order policies configured — consider for time-series or frequently sorted tables."),
+      recommendation: "Set row order policy on tables frequently queried with ORDER BY or time-range filters.",
+    });
+
+    // EH-020: Stored Functions Audit
+    const functions = kqlRows("functions");
+    rules.push({
+      id: "EH-020", rule: `${pre}Stored Functions Inventory`, category: "Data Management", severity: "INFO",
+      status: err("functions") ? "ERROR" : "PASS",
+      details: err("functions") ?? (functions.length > 0 ? `${functions.length} stored function(s) registered.` : "No stored functions."),
+      recommendation: "Review stored functions periodically and remove unused ones.",
+    });
   }
 
   return renderRuleReport(
@@ -525,6 +658,104 @@ export async function eventhouseOptimizationRecommendations(args: {
     rules
   );
 }
+
+// ──────────────────────────────────────────────
+// Structured Fix Definitions — like WAREHOUSE_FIXES
+// ──────────────────────────────────────────────
+
+interface EventhouseFixDef {
+  description: string;
+  getCommands: (
+    args: { dbName: string; tableName?: string; cachingDays?: number; retentionDays?: number },
+    diagnostics: Record<string, { rows?: KqlRow[]; error?: string }>
+  ) => string[];
+}
+
+const EVENTHOUSE_FIXES: Record<string, EventhouseFixDef> = {
+  "EH-002": {
+    description: "Merge fragmented tables (>100 extents, <100K rows/extent)",
+    getCommands: (args, diag) => {
+      if (args.tableName) {
+        return [`.merge table ['${args.tableName}']`];
+      }
+      const fragmented = (diag.extentStats?.rows ?? []).filter(x => {
+        const extents = x.ExtentCount as number;
+        const totalRows = x.TotalRows as number;
+        return extents > 100 && totalRows > 0 && (totalRows / extents) < 100000;
+      });
+      return fragmented.map(r => `.merge table ['${r.TableName}']`);
+    },
+  },
+  "EH-004": {
+    description: "Set hot cache policy",
+    getCommands: (args) => {
+      const days = args.cachingDays ?? 30;
+      if (args.tableName) {
+        return [`.alter table ['${args.tableName}'] policy caching hot = ${days}d`];
+      }
+      return [`.alter database ['${args.dbName}'] policy caching hot = ${days}d`];
+    },
+  },
+  "EH-005": {
+    description: "Set retention policy",
+    getCommands: (args) => {
+      const days = args.retentionDays ?? 365;
+      if (args.tableName) {
+        return [`.alter table ['${args.tableName}'] policy retention softdelete = ${days}d`];
+      }
+      return [`.alter database ['${args.dbName}'] policy retention softdelete = ${days}d`];
+    },
+  },
+  "EH-006": {
+    description: "Re-enable unhealthy materialized views",
+    getCommands: (_args, diag) => {
+      const views = (diag.materializedViews?.rows ?? []).filter(v => isFalsy(v.IsHealthy));
+      return views.map(v => `.enable materialized-view ['${v.Name ?? v.MaterializedViewName}']`);
+    },
+  },
+  "EH-014": {
+    description: "Set ingestion batching policy (MaxItems=500, MaxDelay=00:05:00)",
+    getCommands: (args) => {
+      if (args.tableName) {
+        return [`.alter table ['${args.tableName}'] policy ingestionbatching @'{"MaximumBatchingTimeSpan":"00:05:00","MaximumNumberOfItems":500,"MaximumRawDataSizeMB":1024}'`];
+      }
+      return [`.alter database ['${args.dbName}'] policy ingestionbatching @'{"MaximumBatchingTimeSpan":"00:05:00","MaximumNumberOfItems":500,"MaximumRawDataSizeMB":1024}'`];
+    },
+  },
+  "EH-016": {
+    description: "Set hash partitioning policy on large tables (>1 GB) without one",
+    getCommands: (_args, diag) => {
+      const largeTables = (diag.extentStats?.rows ?? []).filter(x => (x.TotalOriginalSizeMB as number) > 1024);
+      const partitioned = new Set(
+        (diag.partitioningPolicies?.rows ?? [])
+          .filter(x => {
+            const ps = policyString(x, "Policy", "PartitioningPolicy");
+            return ps && ps !== "null" && ps !== "{}" && ps !== "";
+          })
+          .map(x => x.EntityName ?? x.TableName)
+      );
+      return largeTables
+        .filter(t => !partitioned.has(t.TableName as string))
+        .map(t => `.alter table ['${t.TableName}'] policy partitioning '{"PartitionKeys": [{"ColumnName": "ingestion_time()", "Kind": "UniformRange", "Properties": {"Reference": "2024-01-01T00:00:00", "RangeSize": "1.00:00:00", "OverrideCreationTime": false}}]}'`);
+    },
+  },
+  "EH-017": {
+    description: "Set optimized merge policy on fragmented tables",
+    getCommands: (args, diag) => {
+      if (args.tableName) {
+        return [`.alter table ['${args.tableName}'] policy merge @'{"MaxRangeInHours":24,"RowCountUpperBoundForMerge":16000000}'`];
+      }
+      const fragmented = (diag.extentStats?.rows ?? []).filter(x => {
+        const extents = x.ExtentCount as number;
+        const totalRows = x.TotalRows as number;
+        return extents > 100 && totalRows > 0 && (totalRows / extents) < 100000;
+      });
+      return fragmented.map(r => `.alter table ['${r.TableName}'] policy merge @'{"MaxRangeInHours":24,"RowCountUpperBoundForMerge":16000000}'`);
+    },
+  },
+};
+
+const FIXABLE_RULE_IDS = Object.keys(EVENTHOUSE_FIXES);
 
 // ──────────────────────────────────────────────
 // Tool: eventhouse_fix — Auto-fix detected issues
@@ -538,7 +769,18 @@ export async function eventhouseFix(args: {
   tableName?: string;
   cachingDays?: number;
   retentionDays?: number;
+  dryRun?: boolean;
 }): Promise<string> {
+  // Input validation
+  if (args.tableName) validateKqlName(args.tableName, "tableName");
+  if (args.kqlDatabaseName) validateKqlName(args.kqlDatabaseName, "kqlDatabaseName");
+  if (args.cachingDays !== undefined && (args.cachingDays < 1 || args.cachingDays > 36500)) {
+    throw new Error("cachingDays must be between 1 and 36500.");
+  }
+  if (args.retentionDays !== undefined && (args.retentionDays < 1 || args.retentionDays > 36500)) {
+    throw new Error("retentionDays must be between 1 and 36500.");
+  }
+
   const [eventhouse, kqlDatabases] = await Promise.all([
     getEventhouse(args.workspaceId, args.eventhouseId),
     listKqlDatabases(args.workspaceId),
@@ -553,70 +795,77 @@ export async function eventhouseFix(args: {
     ? ehDatabases.filter(db => db.displayName === args.kqlDatabaseName)
     : (ehDatabases.length > 0 ? ehDatabases : kqlDatabases);
 
+  const isDryRun = args.dryRun ?? false;
   const results: string[] = [];
   let totalFixed = 0;
   let totalFailed = 0;
+  let totalSkipped = 0;
 
   for (const db of databasesToFix) {
-    const ruleIds = args.ruleIds ?? ["EH-002", "EH-004", "EH-005"];
+    // Validate db name
+    validateKqlName(db.displayName, "database name");
+
+    // Run needed diagnostics for fix generation
+    const diagKeys: Record<string, { query: string; isMgmt: boolean }> = {
+      extentStats: KQL_DIAGNOSTICS.extentStats,
+      materializedViews: KQL_DIAGNOSTICS.materializedViews,
+      partitioningPolicies: KQL_DIAGNOSTICS.partitioningPolicies,
+    };
+    const diagnostics = await runKqlDiagnostics(queryUri, db.displayName, diagKeys);
+
+    const ruleIds = args.ruleIds && args.ruleIds.length > 0
+      ? args.ruleIds.filter(id => FIXABLE_RULE_IDS.includes(id))
+      : FIXABLE_RULE_IDS;
 
     for (const ruleId of ruleIds) {
-      let commands: string[] = [];
+      const fix = EVENTHOUSE_FIXES[ruleId];
+      if (!fix) continue;
 
-      if (ruleId === "EH-002" && args.tableName) {
-        // Fix fragmentation: merge table
-        commands = [`.merge table ['${args.tableName}']`];
-      } else if (ruleId === "EH-002" && !args.tableName) {
-        // Find fragmented tables and merge them
-        const extents = await runKqlDiagnostics(queryUri, db.displayName, {
-          ext: { query: `.show database extents | summarize ExtentCount=count(), TotalRows=sum(RowCount) by TableName | where ExtentCount > 100 and TotalRows/ExtentCount < 100000`, isMgmt: true },
-        });
-        const fragmented = extents.ext?.rows ?? [];
-        commands = fragmented.map(r => `.merge table ['${r.TableName}']`);
-      }
+      const commands = fix.getCommands(
+        { dbName: db.displayName, tableName: args.tableName, cachingDays: args.cachingDays, retentionDays: args.retentionDays },
+        diagnostics
+      );
 
-      if (ruleId === "EH-004") {
-        const days = args.cachingDays ?? 30;
-        if (args.tableName) {
-          commands = [`.alter table ['${args.tableName}'] policy caching hot = ${days}d`];
-        } else {
-          commands = [`.alter database ['${db.displayName}'] policy caching hot = ${days}d`];
-        }
-      }
-
-      if (ruleId === "EH-005") {
-        const days = args.retentionDays ?? 365;
-        if (args.tableName) {
-          commands = [`.alter table ['${args.tableName}'] policy retention softdelete = ${days}d`];
-        } else {
-          commands = [`.alter database ['${db.displayName}'] policy retention softdelete = ${days}d`];
-        }
+      if (commands.length === 0) {
+        results.push(`| ${ruleId} | ⚪ | ${db.displayName} | No action needed |`);
+        totalSkipped++;
+        continue;
       }
 
       for (const cmd of commands) {
-        try {
-          await executeKqlMgmt(queryUri, db.displayName, cmd);
-          results.push(`| ${ruleId} | ✅ | ${db.displayName} | \`${cmd.substring(0, 80)}\` |`);
-          totalFixed++;
-        } catch (error) {
-          const msg = error instanceof Error ? error.message : String(error);
-          results.push(`| ${ruleId} | ❌ | ${db.displayName}: ${msg.substring(0, 60)} | \`${cmd.substring(0, 60)}\` |`);
-          totalFailed++;
+        if (isDryRun) {
+          results.push(`| ${ruleId} | 🔍 | ${db.displayName} | \`${cmd.substring(0, 80)}\` |`);
+          totalSkipped++;
+        } else {
+          try {
+            await executeKqlMgmt(queryUri, db.displayName, cmd);
+            results.push(`| ${ruleId} | ✅ | ${db.displayName} | \`${cmd.substring(0, 80)}\` |`);
+            totalFixed++;
+          } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            results.push(`| ${ruleId} | ❌ | ${db.displayName}: ${msg.substring(0, 60)} | \`${cmd.substring(0, 60)}\` |`);
+            totalFailed++;
+          }
         }
       }
     }
   }
 
+  const mode = isDryRun ? "DRY RUN (preview only)" : "Applying fixes";
   return [
     `# 🔧 Eventhouse Fix: ${eventhouse.displayName}`,
     "",
-    `_Applying fixes at ${new Date().toISOString()}_`,
+    `_${mode} at ${new Date().toISOString()}_`,
     "",
-    `**${totalFixed} fixed, ${totalFailed} failed**`,
+    isDryRun
+      ? `**${totalSkipped} command(s) previewed** — re-run without dryRun to apply.`
+      : `**${totalFixed} fixed, ${totalFailed} failed${totalSkipped > 0 ? `, ${totalSkipped} skipped` : ""}**`,
     "",
     "| Rule | Status | Database | Command |",
     "|------|--------|----------|---------|",
     ...results,
+    "",
+    isDryRun ? "> 💡 Set `dryRun: false` to execute these commands." : "",
   ].join("\n");
 }
 
@@ -660,9 +909,9 @@ export const eventhouseTools = [
     name: "eventhouse_optimization_recommendations",
     description:
       "LIVE SCAN: Connects to a Fabric Eventhouse KQL endpoint and runs real diagnostic commands. " +
-      "Analyzes table storage/fragmentation (extent stats), caching policies, retention policies, " +
-      "materialized views health, ingestion batching, and streaming ingestion config. " +
-      "Returns findings with prioritized action items.",
+      "Analyzes 20 rules: table storage/fragmentation (extent stats), caching policies, retention policies, " +
+      "materialized views health, ingestion batching, streaming ingestion, partitioning, merge/encoding/row_order policies, " +
+      "stored functions, and query performance. Returns findings with prioritized action items.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -683,18 +932,20 @@ export const eventhouseTools = [
     name: "eventhouse_fix",
     description:
       "AUTO-FIX: Applies fixes to a Fabric Eventhouse. " +
-      "Can fix: extent fragmentation (merge), caching policy, retention policy. " +
-      "Specify ruleIds, optional tableName, cachingDays, retentionDays.",
+      "Fixable rules: EH-002 (merge fragmentation), EH-004 (caching), EH-005 (retention), " +
+      "EH-006 (re-enable materialized views), EH-014 (ingestion batching), EH-016 (partitioning), EH-017 (merge policy). " +
+      "Use dryRun=true to preview commands without executing them.",
     inputSchema: {
       type: "object" as const,
       properties: {
         workspaceId: { type: "string", description: "The ID of the Fabric workspace" },
         eventhouseId: { type: "string", description: "The ID of the eventhouse to fix" },
-        ruleIds: { type: "array", items: { type: "string" }, description: "Rule IDs to fix: EH-002 (merge), EH-004 (caching), EH-005 (retention)" },
+        ruleIds: { type: "array", items: { type: "string" }, description: "Rule IDs to fix: EH-002, EH-004, EH-005, EH-006, EH-014, EH-016, EH-017" },
         kqlDatabaseName: { type: "string", description: "Optional: specific KQL database name" },
         tableName: { type: "string", description: "Optional: specific table name" },
         cachingDays: { type: "number", description: "Hot cache days (default: 30)" },
         retentionDays: { type: "number", description: "Retention days (default: 365)" },
+        dryRun: { type: "boolean", description: "If true, preview commands without executing them (default: false)" },
       },
       required: ["workspaceId", "eventhouseId"],
     },
