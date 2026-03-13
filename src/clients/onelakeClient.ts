@@ -4,6 +4,16 @@ const ONELAKE_DFS = "https://onelake.dfs.fabric.microsoft.com";
 const STORAGE_SCOPE = "https://storage.azure.com/.default";
 
 // ──────────────────────────────────────────────
+// Path safety — prevent path traversal attacks
+// ──────────────────────────────────────────────
+
+function validateOneLakePath(path: string, label: string): void {
+  if (path.includes("..") || path.startsWith("/") || path.includes("://")) {
+    throw new Error(`Invalid ${label}: path traversal not allowed.`);
+  }
+}
+
+// ──────────────────────────────────────────────
 // OneLake ADLS Gen2 REST API Client
 // ──────────────────────────────────────────────
 
@@ -33,6 +43,7 @@ export async function listOneLakeFiles(
   lakehouseName: string,
   relativePath: string
 ): Promise<string[]> {
+  validateOneLakePath(relativePath, "relativePath");
   const filesystem = `${workspaceName}`;
   const directory = `${lakehouseName}.Lakehouse/${relativePath}`;
 
@@ -60,6 +71,7 @@ export async function readOneLakeFile(
   lakehouseName: string,
   relativePath: string
 ): Promise<string> {
+  validateOneLakePath(relativePath, "relativePath");
   const fullPath = `${encodeURIComponent(workspaceName)}/${encodeURIComponent(lakehouseName)}.Lakehouse/${relativePath}`;
   const response = await onelakeFetch(fullPath);
   return response.text();

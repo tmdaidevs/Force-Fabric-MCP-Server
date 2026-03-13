@@ -9,6 +9,29 @@ import { renderRuleReport } from "./ruleEngine.js";
 import type { RuleResult } from "./ruleEngine.js";
 
 // ──────────────────────────────────────────────
+// Input validation — prevent SQL injection in auto-fix
+// ──────────────────────────────────────────────
+
+const SAFE_SQL_NAME = /^[a-zA-Z0-9_\[\].\- ]+$/;
+
+function validateSqlName(value: string, label: string): void {
+  if (!SAFE_SQL_NAME.test(value)) {
+    throw new Error(`Invalid ${label}: must be alphanumeric/underscore/bracket/dot only.`);
+  }
+}
+
+/** Bracket-quote a SQL identifier (schema.table → [schema].[table]) */
+function quoteSqlId(name: string): string {
+  // If already bracketed, return as-is
+  if (name.startsWith("[") && name.endsWith("]")) return name;
+  // Handle schema.table format
+  return name.split(".").map(part => {
+    const trimmed = part.replace(/^\[|\]$/g, "");
+    return `[${trimmed}]`;
+  }).join(".");
+}
+
+// ──────────────────────────────────────────────
 // Tool: warehouse_list
 // ──────────────────────────────────────────────
 
@@ -1025,13 +1048,14 @@ const WAREHOUSE_FIXES: Record<string, {
     getSql: (_args, diag) => {
       const tables = diag.missingPrimaryKeys?.rows ?? [];
       return tables.map(t => {
-        const tbl = t.table_name as string;
+        const tbl = quoteSqlId(t.table_name as string);
+        const tblSafe = (t.table_name as string).replace(/[^a-zA-Z0-9_]/g, "_");
         // Find first *Id or *_id column as PK candidate
         const cols = diag.nullableKeyColumns?.rows?.filter(c =>
-          (c.table_name as string) === tbl
+          (c.table_name as string) === (t.table_name as string)
         ) ?? [];
-        const pkCol = cols.length > 0 ? cols[0].COLUMN_NAME as string : "id";
-        return `ALTER TABLE ${tbl} ADD CONSTRAINT PK_${tbl.replace(/\./g, "_")} PRIMARY KEY NONCLUSTERED (${pkCol}) NOT ENFORCED`;
+        const pkCol = cols.length > 0 ? `[${cols[0].COLUMN_NAME as string}]` : "[id]";
+        return `ALTER TABLE ${tbl} ADD CONSTRAINT [PK_${tblSafe}] PRIMARY KEY NONCLUSTERED (${pkCol}) NOT ENFORCED`;
       });
     },
   },
@@ -1040,14 +1064,14 @@ const WAREHOUSE_FIXES: Record<string, {
     getSql: (_args, diag) => {
       const stale = diag.staleStatistics?.rows ?? [];
       const tables = [...new Set(stale.map(s => s.table_name as string))];
-      return tables.map(t => `UPDATE STATISTICS ${t}`);
+      return tables.map(t => `UPDATE STATISTICS ${quoteSqlId(t)}`);
     },
   },
   "WH-009": {
     description: "Re-enable disabled/untrusted constraints",
     getSql: (_args, diag) => {
       const constraints = diag.constraintCheck?.rows ?? [];
-      return constraints.map(c => `ALTER TABLE ${c.table_name} WITH CHECK CHECK CONSTRAINT [${c.constraint_name}]`);
+      return constraints.map(c => `ALTER TABLE ${quoteSqlId(c.table_name as string)} WITH CHECK CHECK CONSTRAINT [${c.constraint_name}]`);
     },
   },
   "WH-016": {
@@ -1055,7 +1079,7 @@ const WAREHOUSE_FIXES: Record<string, {
     getSql: (_args, diag) => {
       const tables = diag.missingAuditColumns?.rows ?? [];
       return tables.map(t =>
-        `ALTER TABLE ${t.table_name} ADD created_at DATETIME2 NULL DEFAULT GETDATE(), updated_at DATETIME2 NULL DEFAULT GETDATE()`
+        `ALTER TABLE ${quoteSqlId(t.table_name as string)} ADD [created_at] DATETIME2 NULL DEFAULT GETDATE(), [updated_at] DATETIME2 NULL DEFAULT GETDATE()`
       );
     },
   },
@@ -1072,7 +1096,7 @@ const WAREHOUSE_FIXES: Record<string, {
           const fn = colLower.includes("email") ? "email()" :
             colLower.includes("phone") || colLower.includes("mobile") ? "partial(0,\"XXX-XXX-\",4)" :
               "default()";
-          return `ALTER TABLE ${c.table_name} ALTER COLUMN [${col}] ADD MASKED WITH (FUNCTION = '${fn}')`;
+          return `ALTER TABLE ${quoteSqlId(c.table_name as string)} ALTER COLUMN [${col}] ADD MASKED WITH (FUNCTION = '${fn}')`;
         });
     },
   },
@@ -1122,7 +1146,7 @@ const WAREHOUSE_FIXES: Record<string, {
     getSql: (_args, diag) => {
       const missing = diag.missingDefaults?.rows ?? [];
       return missing.slice(0, 20).map(r =>
-        `ALTER TABLE ${r.table_name} ADD DEFAULT '' FOR [${r.column_name}]`
+        `ALTER TABLE ${quoteSqlId(r.table_name as string)} ADD DEFAULT '' FOR [${r.column_name}]`
       );
     },
   },
@@ -1132,6 +1156,7 @@ export async function warehouseFix(args: {
   workspaceId: string;
   warehouseId: string;
   ruleIds?: string[];
+  dryRun?: boolean;
 }): Promise<string> {
   const warehouse = await getWarehouse(args.workspaceId, args.warehouseId);
   const connectionString = warehouse.properties?.connectionString;
@@ -1139,6 +1164,11 @@ export async function warehouseFix(args: {
   if (!connectionString) {
     return "❌ No SQL connection string available. Cannot apply fixes.";
   }
+
+  // Input validation
+  validateSqlName(warehouse.displayName, "warehouse name");
+
+  const isDryRun = args.dryRun ?? false;
 
   // Run diagnostics to get current state
   const DIAG_QUERIES: Record<string, string> = {};
@@ -1158,15 +1188,10 @@ export async function warehouseFix(args: {
     ? args.ruleIds.filter(id => fixableRuleIds.includes(id))
     : fixableRuleIds;
 
-  const results: string[] = [
-    `# 🔧 Warehouse Fix: ${warehouse.displayName}`,
-    "",
-    `_Applying fixes at ${new Date().toISOString()}_`,
-    "",
-  ];
-
+  const results: string[] = [];
   let totalFixed = 0;
   let totalFailed = 0;
+  let totalSkipped = 0;
 
   for (const ruleId of ruleIds) {
     const fix = WAREHOUSE_FIXES[ruleId];
@@ -1179,29 +1204,43 @@ export async function warehouseFix(args: {
 
     if (sqls.length === 0) {
       results.push(`| ${ruleId} | ⚪ | No action needed | — |`);
+      totalSkipped++;
       continue;
     }
 
     for (const sql of sqls) {
-      try {
-        await executeSqlQuery(connectionString, warehouse.displayName, sql);
-        results.push(`| ${ruleId} | ✅ | ${fix.description} | \`${sql.substring(0, 80)}...\` |`);
-        totalFixed++;
-      } catch (error) {
-        const msg = error instanceof Error ? error.message : String(error);
-        results.push(`| ${ruleId} | ❌ | Failed: ${msg.substring(0, 80)} | \`${sql.substring(0, 60)}...\` |`);
-        totalFailed++;
+      if (isDryRun) {
+        results.push(`| ${ruleId} | 🔍 | ${fix.description} | \`${sql.substring(0, 80)}...\` |`);
+        totalSkipped++;
+      } else {
+        try {
+          await executeSqlQuery(connectionString, warehouse.displayName, sql);
+          results.push(`| ${ruleId} | ✅ | ${fix.description} | \`${sql.substring(0, 80)}...\` |`);
+          totalFixed++;
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          results.push(`| ${ruleId} | ❌ | Failed: ${msg.substring(0, 80)} | \`${sql.substring(0, 60)}...\` |`);
+          totalFailed++;
+        }
       }
     }
   }
 
+  const mode = isDryRun ? "DRY RUN (preview only)" : "Applying fixes";
   return [
-    results[0], results[1], results[2], results[3],
-    `**${totalFixed} fixed, ${totalFailed} failed**`,
+    `# 🔧 Warehouse Fix: ${warehouse.displayName}`,
+    "",
+    `_${mode} at ${new Date().toISOString()}_`,
+    "",
+    isDryRun
+      ? `**${totalSkipped} command(s) previewed** — re-run without dryRun to apply.`
+      : `**${totalFixed} fixed, ${totalFailed} failed${totalSkipped > 0 ? `, ${totalSkipped} skipped` : ""}**`,
     "",
     "| Rule | Status | Action | SQL |",
     "|------|--------|--------|-----|",
-    ...results.slice(4),
+    ...results,
+    "",
+    isDryRun ? "> 💡 Set `dryRun: false` to execute these commands." : "",
   ].join("\n");
 }
 
@@ -1277,7 +1316,8 @@ export const warehouseTools = [
       "Can fix: stale statistics, missing PKs, disabled constraints, missing audit columns, " +
       "sensitive data masking, database settings (AUTO_UPDATE_STATISTICS, result set caching, " +
       "snapshot isolation, ANSI settings), and missing default constraints. " +
-      "Specify ruleIds to fix specific issues, or omit to fix all auto-fixable issues.",
+      "Specify ruleIds to fix specific issues, or omit to fix all auto-fixable issues. " +
+      "Use dryRun=true to preview SQL commands without executing them.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -1293,6 +1333,10 @@ export const warehouseTools = [
           type: "array",
           items: { type: "string" },
           description: "Optional: specific rule IDs to fix (e.g. ['WH-008', 'WH-026']). If omitted, all auto-fixable rules are applied.",
+        },
+        dryRun: {
+          type: "boolean",
+          description: "If true, preview SQL commands without executing them (default: false)",
         },
       },
       required: ["workspaceId", "warehouseId"],

@@ -24,6 +24,18 @@ import {
 import type { DeltaLogAnalysis } from "../clients/onelakeClient.js";
 
 // ──────────────────────────────────────────────
+// Input validation — prevent Spark SQL injection
+// ──────────────────────────────────────────────
+
+const SAFE_SPARK_NAME = /^[a-zA-Z0-9_\- .]+$/;
+
+function validateSparkName(value: string, label: string): void {
+  if (!SAFE_SPARK_NAME.test(value)) {
+    throw new Error(`Invalid ${label}: must be alphanumeric/underscore/dash/dot only.`);
+  }
+}
+
+// ──────────────────────────────────────────────
 // Tool: lakehouse_list
 // ──────────────────────────────────────────────
 
@@ -992,23 +1004,30 @@ export async function lakehouseOptimizationRecommendations(args: {
 // Tool: lakehouse_fix — Spark SQL fixes via temp Notebook
 // ──────────────────────────────────────────────
 
-const LAKEHOUSE_FIX_COMMANDS: Record<string, (lakehouseName: string, tableName: string) => string> = {
-  "auto-optimize": (lh, t) =>
-    `spark.sql("ALTER TABLE \`${lh}\`.\`${t}\` SET TBLPROPERTIES ('delta.autoOptimize.optimizeWrite' = 'true', 'delta.autoOptimize.autoCompact' = 'true')")
-print("✅ Auto-optimize enabled for ${t}")`,
-
-  "retention": (lh, t) =>
-    `spark.sql("ALTER TABLE \`${lh}\`.\`${t}\` SET TBLPROPERTIES ('delta.logRetentionDuration' = 'interval 30 days', 'delta.deletedFileRetentionDuration' = 'interval 7 days')")
-print("✅ Retention policy set for ${t}")`,
-
-  "data-skipping": (lh, t) =>
-    `spark.sql("ALTER TABLE \`${lh}\`.\`${t}\` SET TBLPROPERTIES ('delta.dataSkippingNumIndexedCols' = '32')")
-print("✅ Data skipping enabled for ${t}")`,
-
-  "audit-columns": (lh, t) =>
-    `from pyspark.sql.functions import current_timestamp
-spark.sql("ALTER TABLE \`${lh}\`.\`${t}\` ADD COLUMNS (created_at TIMESTAMP, updated_at TIMESTAMP)")
-print("✅ Audit columns added to ${t}")`,
+const LAKEHOUSE_FIX_COMMANDS: Record<string, {
+  description: string;
+  getCode: (lakehouseName: string, tableName: string) => string;
+}> = {
+  "auto-optimize": {
+    description: "Enable auto-optimize (optimizeWrite + autoCompact)",
+    getCode: (lh, t) =>
+      `spark.sql("ALTER TABLE \`${lh}\`.\`${t}\` SET TBLPROPERTIES ('delta.autoOptimize.optimizeWrite' = 'true', 'delta.autoOptimize.autoCompact' = 'true')")\nprint("✅ Auto-optimize enabled for ${t}")`,
+  },
+  "retention": {
+    description: "Set log retention (30 days) and deleted file retention (7 days)",
+    getCode: (lh, t) =>
+      `spark.sql("ALTER TABLE \`${lh}\`.\`${t}\` SET TBLPROPERTIES ('delta.logRetentionDuration' = 'interval 30 days', 'delta.deletedFileRetentionDuration' = 'interval 7 days')")\nprint("✅ Retention policy set for ${t}")`,
+  },
+  "data-skipping": {
+    description: "Enable data skipping with 32 indexed columns",
+    getCode: (lh, t) =>
+      `spark.sql("ALTER TABLE \`${lh}\`.\`${t}\` SET TBLPROPERTIES ('delta.dataSkippingNumIndexedCols' = '32')")\nprint("✅ Data skipping enabled for ${t}")`,
+  },
+  "audit-columns": {
+    description: "Add created_at and updated_at audit columns",
+    getCode: (lh, t) =>
+      `from pyspark.sql.functions import current_timestamp\nspark.sql("ALTER TABLE \`${lh}\`.\`${t}\` ADD COLUMNS (created_at TIMESTAMP, updated_at TIMESTAMP)")\nprint("✅ Audit columns added to ${t}")`,
+  },
 };
 
 export async function lakehouseFix(args: {
@@ -1016,23 +1035,54 @@ export async function lakehouseFix(args: {
   lakehouseId: string;
   tableName: string;
   fixIds?: string[];
+  dryRun?: boolean;
 }): Promise<string> {
+  // Input validation
+  validateSparkName(args.tableName, "tableName");
+
   const lakehouse = await getLakehouse(args.workspaceId, args.lakehouseId);
   const fixIds = args.fixIds ?? Object.keys(LAKEHOUSE_FIX_COMMANDS);
   const lhName = lakehouse.displayName;
+  const isDryRun = args.dryRun ?? false;
+
+  validateSparkName(lhName, "lakehouse name");
 
   const codeBlocks: string[] = [];
+  const fixDescriptions: { id: string; description: string; code: string }[] = [];
+
   for (const fixId of fixIds) {
-    const gen = LAKEHOUSE_FIX_COMMANDS[fixId];
-    if (gen) codeBlocks.push(gen(lhName, args.tableName));
+    const fix = LAKEHOUSE_FIX_COMMANDS[fixId];
+    if (fix) {
+      const code = fix.getCode(lhName, args.tableName);
+      codeBlocks.push(code);
+      fixDescriptions.push({ id: fixId, description: fix.description, code });
+    }
   }
 
   if (codeBlocks.length === 0) {
     return "❌ No valid fix IDs provided. Available: auto-optimize, retention, data-skipping, audit-columns";
   }
 
-  const code = codeBlocks.join("\n\n");
+  // Dry-run: return preview without executing
+  if (isDryRun) {
+    const lines = [
+      `# 🔧 Lakehouse Fix: ${lhName}.${args.tableName}`,
+      "",
+      `_DRY RUN (preview only) at ${new Date().toISOString()}_`,
+      "",
+      `**${fixDescriptions.length} command(s) previewed** — re-run without dryRun to apply.`,
+      "",
+      "| Fix | Description | Spark SQL |",
+      "|-----|-------------|-----------|",
+    ];
+    for (const f of fixDescriptions) {
+      lines.push(`| ${f.id} | 🔍 ${f.description} | \`${f.code.substring(0, 80)}...\` |`);
+    }
+    lines.push("", "> 💡 Set `dryRun: false` to execute these commands via temporary Notebook.");
+    return lines.join("\n");
+  }
 
+  const code = codeBlocks.join("\n\n");
   const result = await runTemporaryNotebook(args.workspaceId, code);
 
   const lines = [
@@ -1046,8 +1096,8 @@ export async function lakehouseFix(args: {
     "|-----|--------|",
   ];
 
-  for (const fixId of fixIds) {
-    lines.push(`| ${fixId} | ${result.status === "Completed" ? "✅" : "❌"} ${result.error ?? ""} |`);
+  for (const f of fixDescriptions) {
+    lines.push(`| ${f.id} ${f.description} | ${result.status === "Completed" ? "✅" : "❌"} ${result.error ?? ""} |`);
   }
 
   if (result.error) {
@@ -1202,6 +1252,7 @@ export const lakehouseTools = [
       "AUTO-FIX: Applies Spark SQL fixes to a Lakehouse via a temporary Notebook. " +
       "Can fix: auto-optimize, retention policy, data skipping, audit columns. " +
       "Creates a temp notebook, runs it, polls for completion, then deletes it. " +
+      "Use dryRun=true to preview commands without executing them. " +
       "Available fixIds: auto-optimize, retention, data-skipping, audit-columns.",
     inputSchema: {
       type: "object" as const,
@@ -1212,6 +1263,10 @@ export const lakehouseTools = [
         fixIds: {
           type: "array", items: { type: "string" },
           description: "Fix IDs to apply: auto-optimize, retention, data-skipping, audit-columns. If omitted, all are applied.",
+        },
+        dryRun: {
+          type: "boolean",
+          description: "If true, preview commands without executing them (default: false)",
         },
       },
       required: ["workspaceId", "lakehouseId", "tableName"],
