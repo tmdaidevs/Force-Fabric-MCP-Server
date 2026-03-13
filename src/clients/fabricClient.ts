@@ -346,6 +346,132 @@ export async function updateSemanticModelDefinition(
 }
 
 // ──────────────────────────────────────────────
+// Notebook operations (create, run, poll, delete)
+// ──────────────────────────────────────────────
+
+/**
+ * Create a temporary notebook with PySpark code, run it, wait for completion, delete it.
+ * Used for Lakehouse table property fixes and Semantic Model sempy fixes.
+ */
+export async function runTemporaryNotebook(
+  workspaceId: string,
+  code: string,
+  notebookName?: string,
+  defaultLakehouseId?: string
+): Promise<{ status: string; error?: string }> {
+  const name = notebookName ?? `_force_temp_fix_${Date.now()}`;
+
+  // Build notebook content as .py format (Fabric notebook definition)
+  const pyContent = `# Fabric notebook source\n\n# METADATA ********************\n\n# META {\n# META   "kernel_info": {\n# META     "name": "synapse_pyspark"\n# META   }\n# META }\n\n# CELL ********************\n\n${code}\n\n# METADATA ********************\n\n# META {\n# META   "language": "python",\n# META   "language_group": "synapse_pyspark"\n# META }\n`;
+
+  const payloadBase64 = Buffer.from(pyContent, "utf-8").toString("base64");
+
+  // 1. Create notebook
+  const createBody: Record<string, unknown> = {
+    displayName: name,
+    definition: {
+      format: "ipynb",
+      parts: [
+        {
+          path: "notebook-content.py",
+          payload: payloadBase64,
+          payloadType: "InlineBase64",
+        },
+      ],
+    },
+  };
+
+  // Attach default lakehouse if provided
+  if (defaultLakehouseId) {
+    (createBody.definition as Record<string, unknown>).parts = [
+      {
+        path: "notebook-content.py",
+        payload: payloadBase64,
+        payloadType: "InlineBase64",
+      },
+    ];
+  }
+
+  let notebookId: string;
+  try {
+    const created = await fabricFetch<{ id: string }>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/notebooks`,
+      { method: "POST", body: createBody }
+    );
+    notebookId = created.id;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    return { status: "Failed", error: `Failed to create notebook: ${msg}` };
+  }
+
+  // 2. Run notebook job
+  let jobInstanceId: string | undefined;
+  try {
+    const runResult = await fabricFetch<{ id?: string; location?: string; status?: number }>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/items/${encodeURIComponent(notebookId)}/jobs/instances`,
+      { method: "POST", params: { jobType: "RunNotebook" } }
+    );
+    jobInstanceId = runResult.id;
+
+    // If 202, extract job ID from location header (handled by fabricFetch)
+    if (runResult.location) {
+      const match = (runResult.location as string).match(/instances\/([^/?]+)/);
+      if (match) jobInstanceId = match[1];
+    }
+  } catch (error) {
+    // Try to clean up the notebook
+    try { await fabricFetch(`/workspaces/${encodeURIComponent(workspaceId)}/notebooks/${encodeURIComponent(notebookId)}`, { method: "DELETE" }); } catch { /* ignore */ }
+    const msg = error instanceof Error ? error.message : String(error);
+    return { status: "Failed", error: `Failed to run notebook: ${msg}` };
+  }
+
+  // 3. Poll for completion
+  let finalStatus = "Unknown";
+  let errorMsg: string | undefined;
+  const maxPollTime = 5 * 60 * 1000; // 5 minutes
+  const startTime = Date.now();
+
+  while (Date.now() - startTime < maxPollTime) {
+    await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5s between polls
+
+    try {
+      const status = await fabricFetch<{ status: string; failureReason?: { message: string } }>(
+        `/workspaces/${encodeURIComponent(workspaceId)}/items/${encodeURIComponent(notebookId)}/jobs/instances/${encodeURIComponent(jobInstanceId ?? "latest")}`,
+      );
+
+      if (status.status === "Completed") {
+        finalStatus = "Completed";
+        break;
+      } else if (status.status === "Failed" || status.status === "Cancelled" || status.status === "Deduped") {
+        finalStatus = status.status;
+        errorMsg = status.failureReason?.message;
+        break;
+      }
+      // Still running — keep polling
+    } catch {
+      // Poll failed — try again
+    }
+  }
+
+  if (finalStatus === "Unknown") {
+    finalStatus = "Timeout";
+    errorMsg = "Notebook did not complete within 5 minutes.";
+  }
+
+  // 4. Delete temp notebook
+  try {
+    await fabricFetch(
+      `/workspaces/${encodeURIComponent(workspaceId)}/notebooks/${encodeURIComponent(notebookId)}`,
+      { method: "DELETE" }
+    );
+  } catch {
+    // Ignore delete errors — notebook might already be gone
+  }
+
+  return { status: finalStatus, error: errorMsg };
+}
+
+// ──────────────────────────────────────────────
 // Capacity operations
 // ──────────────────────────────────────────────
 

@@ -5,6 +5,7 @@ import {
   runLakehouseTableMaintenance,
   getLakehouseJobStatus,
   getWorkspace,
+  runTemporaryNotebook,
 } from "../clients/fabricClient.js";
 import { runDiagnosticQueries } from "../clients/sqlClient.js";
 import type { FabricLakehouse, LakehouseTable } from "../clients/fabricClient.js";
@@ -988,6 +989,75 @@ export async function lakehouseOptimizationRecommendations(args: {
 }
 
 // ──────────────────────────────────────────────
+// Tool: lakehouse_fix — Spark SQL fixes via temp Notebook
+// ──────────────────────────────────────────────
+
+const LAKEHOUSE_FIX_COMMANDS: Record<string, (lakehouseName: string, tableName: string) => string> = {
+  "auto-optimize": (lh, t) =>
+    `spark.sql("ALTER TABLE \`${lh}\`.\`${t}\` SET TBLPROPERTIES ('delta.autoOptimize.optimizeWrite' = 'true', 'delta.autoOptimize.autoCompact' = 'true')")
+print("✅ Auto-optimize enabled for ${t}")`,
+
+  "retention": (lh, t) =>
+    `spark.sql("ALTER TABLE \`${lh}\`.\`${t}\` SET TBLPROPERTIES ('delta.logRetentionDuration' = 'interval 30 days', 'delta.deletedFileRetentionDuration' = 'interval 7 days')")
+print("✅ Retention policy set for ${t}")`,
+
+  "data-skipping": (lh, t) =>
+    `spark.sql("ALTER TABLE \`${lh}\`.\`${t}\` SET TBLPROPERTIES ('delta.dataSkippingNumIndexedCols' = '32')")
+print("✅ Data skipping enabled for ${t}")`,
+
+  "audit-columns": (lh, t) =>
+    `from pyspark.sql.functions import current_timestamp
+spark.sql("ALTER TABLE \`${lh}\`.\`${t}\` ADD COLUMNS (created_at TIMESTAMP, updated_at TIMESTAMP)")
+print("✅ Audit columns added to ${t}")`,
+};
+
+export async function lakehouseFix(args: {
+  workspaceId: string;
+  lakehouseId: string;
+  tableName: string;
+  fixIds?: string[];
+}): Promise<string> {
+  const lakehouse = await getLakehouse(args.workspaceId, args.lakehouseId);
+  const fixIds = args.fixIds ?? Object.keys(LAKEHOUSE_FIX_COMMANDS);
+  const lhName = lakehouse.displayName;
+
+  const codeBlocks: string[] = [];
+  for (const fixId of fixIds) {
+    const gen = LAKEHOUSE_FIX_COMMANDS[fixId];
+    if (gen) codeBlocks.push(gen(lhName, args.tableName));
+  }
+
+  if (codeBlocks.length === 0) {
+    return "❌ No valid fix IDs provided. Available: auto-optimize, retention, data-skipping, audit-columns";
+  }
+
+  const code = codeBlocks.join("\n\n");
+
+  const result = await runTemporaryNotebook(args.workspaceId, code);
+
+  const lines = [
+    `# 🔧 Lakehouse Fix: ${lhName}.${args.tableName}`,
+    "",
+    `_Executed at ${new Date().toISOString()}_`,
+    "",
+    `**Status**: ${result.status === "Completed" ? "✅ Success" : `❌ ${result.status}`}`,
+    "",
+    "| Fix | Status |",
+    "|-----|--------|",
+  ];
+
+  for (const fixId of fixIds) {
+    lines.push(`| ${fixId} | ${result.status === "Completed" ? "✅" : "❌"} ${result.error ?? ""} |`);
+  }
+
+  if (result.error) {
+    lines.push("", `**Error**: ${result.error}`);
+  }
+
+  return lines.join("\n");
+}
+
+// ──────────────────────────────────────────────
 // Tool definitions for MCP registration
 // ──────────────────────────────────────────────
 
@@ -1125,5 +1195,27 @@ export const lakehouseTools = [
       required: ["workspaceId", "lakehouseId"],
     },
     handler: lakehouseOptimizationRecommendations,
+  },
+  {
+    name: "lakehouse_fix",
+    description:
+      "AUTO-FIX: Applies Spark SQL fixes to a Lakehouse via a temporary Notebook. " +
+      "Can fix: auto-optimize, retention policy, data skipping, audit columns. " +
+      "Creates a temp notebook, runs it, polls for completion, then deletes it. " +
+      "Available fixIds: auto-optimize, retention, data-skipping, audit-columns.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        workspaceId: { type: "string", description: "The ID of the Fabric workspace" },
+        lakehouseId: { type: "string", description: "The ID of the lakehouse" },
+        tableName: { type: "string", description: "The table to fix" },
+        fixIds: {
+          type: "array", items: { type: "string" },
+          description: "Fix IDs to apply: auto-optimize, retention, data-skipping, audit-columns. If omitted, all are applied.",
+        },
+      },
+      required: ["workspaceId", "lakehouseId", "tableName"],
+    },
+    handler: lakehouseFix,
   },
 ];
