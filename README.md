@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="banner.png" alt="Force Fabric MCP Server — Detect & Optimize" width="100%">
-</p>
-
 <h1 align="center">Force Fabric MCP Server</h1>
 
 <p align="center">
