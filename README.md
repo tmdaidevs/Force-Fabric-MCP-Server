@@ -39,7 +39,7 @@
 | 🏠 **Lakehouse** | 14 fixes | REST API (3) + Notebook Spark SQL (11) |
 | 📐 **Semantic Model** | 12 fixes | model.bim REST API (6) + Notebook sempy (6) |
 | 📊 **Eventhouse** | 3 fixes | KQL management commands |
-| | **41 total** *(+6 planned via Notebook)* | |
+| | **41 total** | |
 
 ### 📊 Unified Output
 
@@ -184,9 +184,9 @@ Downloads model.bim, applies modifications, uploads back:
 | SM-FIX-KEY | Set IsKey=true on PK columns in relationships | model.bim |
 | SM-FIX-AUTODATE | Remove auto-date tables | model.bim |
 
-### 📓 Notebook-Based Fixes (planned)
+### 📓 Notebook-Based Fixes
 
-For fixes that require Spark SQL or sempy, the MCP server creates a **temporary Notebook**, runs it, and deletes it:
+For fixes that require Spark SQL, the MCP server creates a **temporary Notebook**, runs it, and deletes it:
 
 ```
 1. POST /notebooks              → Create temp notebook with fix code
