@@ -17,6 +17,9 @@ export interface KqlResult {
 
 export type KqlRow = Record<string, unknown>;
 
+/** Default per-query timeout in milliseconds (2 minutes). */
+const DEFAULT_QUERY_TIMEOUT_MS = 120_000;
+
 function parseKqlTable(table: KqlTable): KqlRow[] {
   return table.Rows.map((row) => {
     const obj: KqlRow = {};
@@ -33,7 +36,8 @@ function parseKqlTable(table: KqlTable): KqlRow[] {
 export async function executeKqlQuery(
   clusterUri: string,
   database: string,
-  query: string
+  query: string,
+  timeoutMs: number = DEFAULT_QUERY_TIMEOUT_MS
 ): Promise<KqlRow[]> {
   const token = await getTokenForScope(KUSTO_SCOPE);
 
@@ -41,26 +45,34 @@ export async function executeKqlQuery(
   const baseUri = clusterUri.replace(/\/+$/, "");
   const url = `${baseUri}/v1/rest/query`;
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
-    body: JSON.stringify({ db: database, csl: query }),
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`KQL query failed (${response.status}): ${errorText}`);
-  }
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({ db: database, csl: query }),
+      signal: controller.signal,
+    });
 
-  const result = (await response.json()) as KqlResult;
-  if (result.Tables && result.Tables.length > 0) {
-    return parseKqlTable(result.Tables[0]);
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`KQL query failed (${response.status}): ${errorText}`);
+    }
+
+    const result = (await response.json()) as KqlResult;
+    if (result.Tables && result.Tables.length > 0) {
+      return parseKqlTable(result.Tables[0]);
+    }
+    return [];
+  } finally {
+    clearTimeout(timer);
   }
-  return [];
 }
 
 /**
@@ -69,54 +81,78 @@ export async function executeKqlQuery(
 export async function executeKqlMgmt(
   clusterUri: string,
   database: string,
-  command: string
+  command: string,
+  timeoutMs: number = DEFAULT_QUERY_TIMEOUT_MS
 ): Promise<KqlRow[]> {
   const token = await getTokenForScope(KUSTO_SCOPE);
 
   const baseUri = clusterUri.replace(/\/+$/, "");
   const url = `${baseUri}/v1/rest/mgmt`;
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
-    body: JSON.stringify({ db: database, csl: command }),
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`KQL mgmt command failed (${response.status}): ${errorText}`);
-  }
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({ db: database, csl: command }),
+      signal: controller.signal,
+    });
 
-  const result = (await response.json()) as KqlResult;
-  if (result.Tables && result.Tables.length > 0) {
-    return parseKqlTable(result.Tables[0]);
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`KQL mgmt command failed (${response.status}): ${errorText}`);
+    }
+
+    const result = (await response.json()) as KqlResult;
+    if (result.Tables && result.Tables.length > 0) {
+      return parseKqlTable(result.Tables[0]);
+    }
+    return [];
+  } finally {
+    clearTimeout(timer);
   }
-  return [];
 }
 
 /**
- * Run multiple KQL diagnostic commands and return named results.
+ * Run multiple KQL diagnostic commands in parallel and return named results.
+ * Uses a concurrency limit to avoid overwhelming the cluster.
  */
 export async function runKqlDiagnostics(
   clusterUri: string,
   database: string,
-  commands: Record<string, { query: string; isMgmt: boolean }>
+  commands: Record<string, { query: string; isMgmt: boolean }>,
+  concurrency: number = 5
 ): Promise<Record<string, { rows?: KqlRow[]; error?: string }>> {
+  const entries = Object.entries(commands);
   const results: Record<string, { rows?: KqlRow[]; error?: string }> = {};
 
-  for (const [name, cmd] of Object.entries(commands)) {
-    try {
-      const rows = cmd.isMgmt
-        ? await executeKqlMgmt(clusterUri, database, cmd.query)
-        : await executeKqlQuery(clusterUri, database, cmd.query);
-      results[name] = { rows };
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      results[name] = { error: msg };
+  // Process in parallel batches
+  for (let i = 0; i < entries.length; i += concurrency) {
+    const batch = entries.slice(i, i + concurrency);
+    const batchResults = await Promise.allSettled(
+      batch.map(async ([name, cmd]) => {
+        const rows = cmd.isMgmt
+          ? await executeKqlMgmt(clusterUri, database, cmd.query)
+          : await executeKqlQuery(clusterUri, database, cmd.query);
+        return { name, rows };
+      })
+    );
+
+    for (let j = 0; j < batchResults.length; j++) {
+      const entry = batchResults[j];
+      const name = batch[j][0];
+      if (entry.status === "fulfilled") {
+        results[name] = { rows: entry.value.rows };
+      } else {
+        const msg = entry.reason instanceof Error ? entry.reason.message : String(entry.reason);
+        results[name] = { error: msg };
+      }
     }
   }
 
