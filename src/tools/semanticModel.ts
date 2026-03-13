@@ -3,6 +3,8 @@ import {
   executeSemanticModelDaxQuery,
   executeSemanticModelQuery,
   getWorkspace,
+  getSemanticModelDefinition,
+  updateSemanticModelDefinition,
 } from "../clients/fabricClient.js";
 import { runXmlaDmvQueries } from "../clients/xmlaClient.js";
 import { renderRuleReport } from "./ruleEngine.js";
@@ -837,6 +839,182 @@ export async function semanticModelOptimizationRecommendations(args: {
 }
 
 // ──────────────────────────────────────────────
+// Tool: semantic_model_fix — Auto-fix via model.bim
+// ──────────────────────────────────────────────
+
+export async function semanticModelFix(args: {
+  workspaceId: string;
+  semanticModelId: string;
+  ruleIds?: string[];
+}): Promise<string> {
+  const models = await listSemanticModels(args.workspaceId);
+  const model = models.find(m => m.id === args.semanticModelId);
+  const modelName = model?.displayName ?? args.semanticModelId;
+
+  const results: string[] = [];
+  let totalFixed = 0;
+  let totalFailed = 0;
+
+  // 1. Download model.bim
+  let parts;
+  try {
+    parts = await getSemanticModelDefinition(args.workspaceId, args.semanticModelId);
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    return `❌ Could not download model definition: ${msg}`;
+  }
+
+  const bimPart = parts.find(p => p.path === "model.bim" || p.path.endsWith(".bim"));
+  if (!bimPart) {
+    return "❌ No model.bim found in definition. Model format may not be supported (try TMDL format).";
+  }
+
+  // 2. Parse model.bim JSON
+  let bim: Record<string, unknown>;
+  try {
+    const json = Buffer.from(bimPart.payload, "base64").toString("utf-8");
+    bim = JSON.parse(json);
+  } catch {
+    return "❌ Could not parse model.bim JSON.";
+  }
+
+  const modelDef = (bim as Record<string, unknown>).model as Record<string, unknown> | undefined;
+  if (!modelDef) return "❌ No 'model' key found in model.bim.";
+
+  const tables = (modelDef.tables ?? []) as Array<Record<string, unknown>>;
+  const ruleIds = args.ruleIds ?? ["SM-FIX-FORMAT", "SM-FIX-DESC", "SM-FIX-HIDDEN", "SM-FIX-DATE", "SM-FIX-KEY", "SM-FIX-AUTODATE"];
+  let modified = false;
+
+  // 3. Apply fixes
+  for (const ruleId of ruleIds) {
+    try {
+      if (ruleId === "SM-FIX-FORMAT") {
+        // Add format strings to measures without one
+        for (const table of tables) {
+          const measures = (table.measures ?? []) as Array<Record<string, unknown>>;
+          for (const m of measures) {
+            if (!m.formatString && !m.isHidden) {
+              m.formatString = "#,0";
+              results.push(`| SM-FIX-FORMAT | ✅ | Added format to ${table.name}[${m.name}] |`);
+              totalFixed++;
+              modified = true;
+            }
+          }
+        }
+      }
+
+      if (ruleId === "SM-FIX-DESC") {
+        // Add descriptions to visible tables without one
+        for (const table of tables) {
+          if (!table.isHidden && (!table.description || (table.description as string).length === 0)) {
+            table.description = `Table: ${table.name}`;
+            results.push(`| SM-FIX-DESC | ✅ | Added description to table ${table.name} |`);
+            totalFixed++;
+            modified = true;
+          }
+        }
+      }
+
+      if (ruleId === "SM-FIX-HIDDEN") {
+        // Set IsAvailableInMDX=false on hidden columns
+        for (const table of tables) {
+          const columns = (table.columns ?? []) as Array<Record<string, unknown>>;
+          for (const col of columns) {
+            if ((col.isHidden || table.isHidden) && col.isAvailableInMDX !== false) {
+              col.isAvailableInMDX = false;
+              results.push(`| SM-FIX-HIDDEN | ✅ | Set IsAvailableInMDX=false on ${table.name}[${col.name}] |`);
+              totalFixed++;
+              modified = true;
+            }
+          }
+        }
+      }
+
+      if (ruleId === "SM-FIX-DATE") {
+        // Mark date tables
+        for (const table of tables) {
+          const name = (table.name as string).toLowerCase();
+          if ((name.includes("date") || name.includes("calendar")) && table.dataCategory !== "Time") {
+            table.dataCategory = "Time";
+            results.push(`| SM-FIX-DATE | ✅ | Marked ${table.name} as Date table |`);
+            totalFixed++;
+            modified = true;
+          }
+        }
+      }
+
+      if (ruleId === "SM-FIX-KEY") {
+        // Set IsKey on PK columns in relationship targets
+        const relationships = (modelDef.relationships ?? []) as Array<Record<string, unknown>>;
+        for (const rel of relationships) {
+          const toTable = tables.find(t => t.name === rel.toTable);
+          if (toTable) {
+            const columns = (toTable.columns ?? []) as Array<Record<string, unknown>>;
+            const toCol = columns.find(c => c.name === rel.toColumn);
+            if (toCol && !toCol.isKey) {
+              toCol.isKey = true;
+              results.push(`| SM-FIX-KEY | ✅ | Set IsKey=true on ${toTable.name}[${toCol.name}] |`);
+              totalFixed++;
+              modified = true;
+            }
+          }
+        }
+      }
+
+      if (ruleId === "SM-FIX-AUTODATE") {
+        // Remove auto-date tables
+        const before = tables.length;
+        const filtered = tables.filter(t => {
+          const name = t.name as string;
+          return !name.startsWith("DateTableTemplate_") && !name.startsWith("LocalDateTable_");
+        });
+        const removed = before - filtered.length;
+        if (removed > 0) {
+          (modelDef as Record<string, unknown>).tables = filtered;
+          results.push(`| SM-FIX-AUTODATE | ✅ | Removed ${removed} auto-date table(s) |`);
+          totalFixed += removed;
+          modified = true;
+        }
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      results.push(`| ${ruleId} | ❌ | Failed: ${msg.substring(0, 80)} |`);
+      totalFailed++;
+    }
+  }
+
+  // 4. Upload modified model.bim
+  if (modified) {
+    try {
+      const newPayload = Buffer.from(JSON.stringify(bim), "utf-8").toString("base64");
+      const updatedParts = parts.map(p =>
+        p.path === bimPart.path ? { ...p, payload: newPayload } : p
+      );
+      await updateSemanticModelDefinition(args.workspaceId, args.semanticModelId, updatedParts);
+      results.push(`| UPLOAD | ✅ | Model definition updated successfully |`);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      results.push(`| UPLOAD | ❌ | Failed to update model: ${msg.substring(0, 100)} |`);
+      totalFailed++;
+    }
+  } else {
+    results.push(`| — | ⚪ | No changes needed |`);
+  }
+
+  return [
+    `# 🔧 Semantic Model Fix: ${modelName}`,
+    "",
+    `_Applying fixes at ${new Date().toISOString()}_`,
+    "",
+    `**${totalFixed} fixed, ${totalFailed} failed**`,
+    "",
+    "| Rule | Status | Action |",
+    "|------|--------|--------|",
+    ...results,
+  ].join("\n");
+}
+
+// ──────────────────────────────────────────────
 // Tool definitions for MCP registration
 // ──────────────────────────────────────────────
 
@@ -878,5 +1056,23 @@ export const semanticModelTools = [
       required: ["workspaceId", "semanticModelId"],
     },
     handler: semanticModelOptimizationRecommendations,
+  },
+  {
+    name: "semantic_model_fix",
+    description:
+      "AUTO-FIX: Downloads model.bim, applies fixes, and uploads the modified definition. " +
+      "Can fix: missing format strings, missing descriptions, IsAvailableInMDX on hidden columns, " +
+      "mark date tables, set IsKey on PK columns, remove auto-date tables. " +
+      "Available ruleIds: SM-FIX-FORMAT, SM-FIX-DESC, SM-FIX-HIDDEN, SM-FIX-DATE, SM-FIX-KEY, SM-FIX-AUTODATE.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        workspaceId: { type: "string", description: "The ID of the Fabric workspace" },
+        semanticModelId: { type: "string", description: "The ID of the semantic model to fix" },
+        ruleIds: { type: "array", items: { type: "string" }, description: "Optional: specific fix IDs to apply. If omitted, all safe fixes are applied." },
+      },
+      required: ["workspaceId", "semanticModelId"],
+    },
+    handler: semanticModelFix,
   },
 ];

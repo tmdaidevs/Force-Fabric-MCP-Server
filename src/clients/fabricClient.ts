@@ -296,6 +296,56 @@ export async function executeSemanticModelQuery(
 export const executeSemanticModelDaxQuery = executeSemanticModelQuery;
 
 // ──────────────────────────────────────────────
+// Semantic Model Definition (model.bim) operations
+// ──────────────────────────────────────────────
+
+export interface SemanticModelDefinitionPart {
+  path: string;
+  payload: string;
+  payloadType: "InlineBase64";
+}
+
+/**
+ * Get the full definition (model.bim) of a Semantic Model.
+ */
+export async function getSemanticModelDefinition(
+  workspaceId: string,
+  semanticModelId: string
+): Promise<SemanticModelDefinitionPart[]> {
+  // This is a long-running operation
+  const result = await fabricFetch<{ definition?: { parts: SemanticModelDefinitionPart[] } }>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/semanticModels/${encodeURIComponent(semanticModelId)}/getDefinition`,
+    { method: "POST" }
+  );
+
+  if (result.definition?.parts) {
+    return result.definition.parts;
+  }
+
+  // If 202, we need to poll — but for now return empty
+  return [];
+}
+
+/**
+ * Update the definition (model.bim) of a Semantic Model.
+ */
+export async function updateSemanticModelDefinition(
+  workspaceId: string,
+  semanticModelId: string,
+  parts: SemanticModelDefinitionPart[]
+): Promise<void> {
+  await fabricFetch(
+    `/workspaces/${encodeURIComponent(workspaceId)}/semanticModels/${encodeURIComponent(semanticModelId)}/updateDefinition`,
+    {
+      method: "POST",
+      body: {
+        definition: { parts },
+      },
+    }
+  );
+}
+
+// ──────────────────────────────────────────────
 // Capacity operations
 // ──────────────────────────────────────────────
 

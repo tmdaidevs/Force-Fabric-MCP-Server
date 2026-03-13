@@ -2,7 +2,7 @@ import {
   listWarehouses,
   getWarehouse,
 } from "../clients/fabricClient.js";
-import { runDiagnosticQueries } from "../clients/sqlClient.js";
+import { runDiagnosticQueries, executeSqlQuery } from "../clients/sqlClient.js";
 import type { FabricWarehouse } from "../clients/fabricClient.js";
 import type { SqlRow } from "../clients/sqlClient.js";
 import { renderRuleReport } from "./ruleEngine.js";
@@ -1013,6 +1013,199 @@ export async function warehouseAnalyzeQueryPatterns(args: {
 }
 
 // ──────────────────────────────────────────────
+// Tool: warehouse_fix — Auto-fix detected issues
+// ──────────────────────────────────────────────
+
+const WAREHOUSE_FIXES: Record<string, {
+  description: string;
+  getSql: (args: Record<string, unknown>, diagnostics: Record<string, { rows?: SqlRow[] }>) => string[];
+}> = {
+  "WH-001": {
+    description: "Add PRIMARY KEY NOT ENFORCED constraints to tables missing PKs",
+    getSql: (_args, diag) => {
+      const tables = diag.missingPrimaryKeys?.rows ?? [];
+      return tables.map(t => {
+        const tbl = t.table_name as string;
+        // Find first *Id or *_id column as PK candidate
+        const cols = diag.nullableKeyColumns?.rows?.filter(c =>
+          (c.table_name as string) === tbl
+        ) ?? [];
+        const pkCol = cols.length > 0 ? cols[0].COLUMN_NAME as string : "id";
+        return `ALTER TABLE ${tbl} ADD CONSTRAINT PK_${tbl.replace(/\./g, "_")} PRIMARY KEY NONCLUSTERED (${pkCol}) NOT ENFORCED`;
+      });
+    },
+  },
+  "WH-008": {
+    description: "Refresh stale statistics (>30 days old)",
+    getSql: (_args, diag) => {
+      const stale = diag.staleStatistics?.rows ?? [];
+      const tables = [...new Set(stale.map(s => s.table_name as string))];
+      return tables.map(t => `UPDATE STATISTICS ${t}`);
+    },
+  },
+  "WH-009": {
+    description: "Re-enable disabled/untrusted constraints",
+    getSql: (_args, diag) => {
+      const constraints = diag.constraintCheck?.rows ?? [];
+      return constraints.map(c => `ALTER TABLE ${c.table_name} WITH CHECK CHECK CONSTRAINT [${c.constraint_name}]`);
+    },
+  },
+  "WH-016": {
+    description: "Add audit columns (created_at, updated_at) to tables",
+    getSql: (_args, diag) => {
+      const tables = diag.missingAuditColumns?.rows ?? [];
+      return tables.map(t =>
+        `ALTER TABLE ${t.table_name} ADD created_at DATETIME2 NULL DEFAULT GETDATE(), updated_at DATETIME2 NULL DEFAULT GETDATE()`
+      );
+    },
+  },
+  "WH-018": {
+    description: "Apply dynamic data masking to sensitive/PII columns",
+    getSql: (_args, diag) => {
+      const sensitive = diag.sensitiveColumns?.rows ?? [];
+      const masked = new Set((diag.dataMaskingCheck?.rows ?? []).map(r => `${r.table_name}.${r.column_name}`));
+      return sensitive
+        .filter(c => !masked.has(`${c.table_name}.${c.column_name}`))
+        .map(c => {
+          const col = (c.column_name ?? c.COLUMN_NAME) as string;
+          const colLower = col.toLowerCase();
+          const fn = colLower.includes("email") ? "email()" :
+            colLower.includes("phone") || colLower.includes("mobile") ? "partial(0,\"XXX-XXX-\",4)" :
+              "default()";
+          return `ALTER TABLE ${c.table_name} ALTER COLUMN [${col}] ADD MASKED WITH (FUNCTION = '${fn}')`;
+        });
+    },
+  },
+  "WH-026": {
+    description: "Enable AUTO_UPDATE_STATISTICS",
+    getSql: (args) => [`ALTER DATABASE [${args.warehouseName ?? "current"}] SET AUTO_UPDATE_STATISTICS ON`],
+  },
+  "WH-027": {
+    description: "Enable result set caching",
+    getSql: (args) => [`ALTER DATABASE [${args.warehouseName ?? "current"}] SET RESULT_SET_CACHING ON`],
+  },
+  "WH-028": {
+    description: "Enable snapshot isolation",
+    getSql: (args) => [`ALTER DATABASE [${args.warehouseName ?? "current"}] SET ALLOW_SNAPSHOT_ISOLATION ON`],
+  },
+  "WH-029": {
+    description: "Set PAGE_VERIFY to CHECKSUM",
+    getSql: (args) => [`ALTER DATABASE [${args.warehouseName ?? "current"}] SET PAGE_VERIFY CHECKSUM`],
+  },
+  "WH-030": {
+    description: "Enable all ANSI settings",
+    getSql: (args) => {
+      const db = args.warehouseName ?? "current";
+      return [
+        `ALTER DATABASE [${db}] SET ANSI_NULLS ON`,
+        `ALTER DATABASE [${db}] SET ANSI_PADDING ON`,
+        `ALTER DATABASE [${db}] SET ANSI_WARNINGS ON`,
+        `ALTER DATABASE [${db}] SET ARITHABORT ON`,
+        `ALTER DATABASE [${db}] SET QUOTED_IDENTIFIER ON`,
+      ];
+    },
+  },
+  "WH-032": {
+    description: "Create statistics on tables without any",
+    getSql: (_args, diag) => {
+      const tables = diag.tables?.rows ?? [];
+      const stats = diag.stats?.rows ?? [];
+      const noStats = tables.filter(t => {
+        const key = `${t.schema_name}.${t.table_name}`;
+        return !stats.some(s => `${s.schema_name}.${s.table_name}` === key && s.stat_name);
+      });
+      return noStats.map(t => `UPDATE STATISTICS [${t.schema_name}].[${t.table_name}]`);
+    },
+  },
+  "WH-036": {
+    description: "Add DEFAULT constraints to NOT NULL columns without them",
+    getSql: (_args, diag) => {
+      const missing = diag.missingDefaults?.rows ?? [];
+      return missing.slice(0, 20).map(r =>
+        `ALTER TABLE ${r.table_name} ADD DEFAULT '' FOR [${r.column_name}]`
+      );
+    },
+  },
+};
+
+export async function warehouseFix(args: {
+  workspaceId: string;
+  warehouseId: string;
+  ruleIds?: string[];
+}): Promise<string> {
+  const warehouse = await getWarehouse(args.workspaceId, args.warehouseId);
+  const connectionString = warehouse.properties?.connectionString;
+
+  if (!connectionString) {
+    return "❌ No SQL connection string available. Cannot apply fixes.";
+  }
+
+  // Run diagnostics to get current state
+  const DIAG_QUERIES: Record<string, string> = {};
+  // Only include queries needed by the fixes
+  const neededQueries = ["missingPrimaryKeys", "nullableKeyColumns", "staleStatistics", "constraintCheck",
+    "missingAuditColumns", "sensitiveColumns", "dataMaskingCheck", "tables", "stats", "missingDefaults", "dbSettings"];
+  for (const key of neededQueries) {
+    const allDiag = WAREHOUSE_DIAGNOSTICS as Record<string, string>;
+    if (allDiag[key]) DIAG_QUERIES[key] = allDiag[key];
+  }
+
+  const diagnostics = await runDiagnosticQueries(connectionString, warehouse.displayName, DIAG_QUERIES);
+
+  // Determine which rules to fix
+  const fixableRuleIds = Object.keys(WAREHOUSE_FIXES);
+  const ruleIds = args.ruleIds && args.ruleIds.length > 0
+    ? args.ruleIds.filter(id => fixableRuleIds.includes(id))
+    : fixableRuleIds;
+
+  const results: string[] = [
+    `# 🔧 Warehouse Fix: ${warehouse.displayName}`,
+    "",
+    `_Applying fixes at ${new Date().toISOString()}_`,
+    "",
+  ];
+
+  let totalFixed = 0;
+  let totalFailed = 0;
+
+  for (const ruleId of ruleIds) {
+    const fix = WAREHOUSE_FIXES[ruleId];
+    if (!fix) continue;
+
+    const sqls = fix.getSql(
+      { warehouseName: warehouse.displayName },
+      diagnostics as Record<string, { rows?: SqlRow[] }>
+    );
+
+    if (sqls.length === 0) {
+      results.push(`| ${ruleId} | ⚪ | No action needed | — |`);
+      continue;
+    }
+
+    for (const sql of sqls) {
+      try {
+        await executeSqlQuery(connectionString, warehouse.displayName, sql);
+        results.push(`| ${ruleId} | ✅ | ${fix.description} | \`${sql.substring(0, 80)}...\` |`);
+        totalFixed++;
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        results.push(`| ${ruleId} | ❌ | Failed: ${msg.substring(0, 80)} | \`${sql.substring(0, 60)}...\` |`);
+        totalFailed++;
+      }
+    }
+  }
+
+  return [
+    results[0], results[1], results[2], results[3],
+    `**${totalFixed} fixed, ${totalFailed} failed**`,
+    "",
+    "| Rule | Status | Action | SQL |",
+    "|------|--------|--------|-----|",
+    ...results.slice(4),
+  ].join("\n");
+}
+
+// ──────────────────────────────────────────────
 // Tool definitions for MCP registration
 // ──────────────────────────────────────────────
 
@@ -1076,5 +1269,34 @@ export const warehouseTools = [
       required: ["workspaceId", "warehouseId"],
     },
     handler: warehouseAnalyzeQueryPatterns,
+  },
+  {
+    name: "warehouse_fix",
+    description:
+      "AUTO-FIX: Connects to a Fabric Warehouse and applies fixes for detected issues. " +
+      "Can fix: stale statistics, missing PKs, disabled constraints, missing audit columns, " +
+      "sensitive data masking, database settings (AUTO_UPDATE_STATISTICS, result set caching, " +
+      "snapshot isolation, ANSI settings), and missing default constraints. " +
+      "Specify ruleIds to fix specific issues, or omit to fix all auto-fixable issues.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        workspaceId: {
+          type: "string",
+          description: "The ID of the Fabric workspace",
+        },
+        warehouseId: {
+          type: "string",
+          description: "The ID of the warehouse to fix",
+        },
+        ruleIds: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional: specific rule IDs to fix (e.g. ['WH-008', 'WH-026']). If omitted, all auto-fixable rules are applied.",
+        },
+      },
+      required: ["workspaceId", "warehouseId"],
+    },
+    handler: warehouseFix,
   },
 ];

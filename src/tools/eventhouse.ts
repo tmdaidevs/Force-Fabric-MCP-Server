@@ -3,7 +3,7 @@ import {
   getEventhouse,
   listKqlDatabases,
 } from "../clients/fabricClient.js";
-import { runKqlDiagnostics } from "../clients/kqlClient.js";
+import { runKqlDiagnostics, executeKqlMgmt } from "../clients/kqlClient.js";
 import { renderRuleReport } from "./ruleEngine.js";
 import type { RuleResult } from "./ruleEngine.js";
 import type { FabricEventhouse } from "../clients/fabricClient.js";
@@ -527,6 +527,100 @@ export async function eventhouseOptimizationRecommendations(args: {
 }
 
 // ──────────────────────────────────────────────
+// Tool: eventhouse_fix — Auto-fix detected issues
+// ──────────────────────────────────────────────
+
+export async function eventhouseFix(args: {
+  workspaceId: string;
+  eventhouseId: string;
+  ruleIds?: string[];
+  kqlDatabaseName?: string;
+  tableName?: string;
+  cachingDays?: number;
+  retentionDays?: number;
+}): Promise<string> {
+  const [eventhouse, kqlDatabases] = await Promise.all([
+    getEventhouse(args.workspaceId, args.eventhouseId),
+    listKqlDatabases(args.workspaceId),
+  ]);
+
+  const queryUri = eventhouse.properties?.queryServiceUri;
+  if (!queryUri) return "❌ No query URI available. Cannot apply fixes.";
+
+  const ehDbIds = new Set(eventhouse.properties?.databasesItemIds ?? []);
+  const ehDatabases = kqlDatabases.filter(db => ehDbIds.has(db.id));
+  const databasesToFix = args.kqlDatabaseName
+    ? ehDatabases.filter(db => db.displayName === args.kqlDatabaseName)
+    : (ehDatabases.length > 0 ? ehDatabases : kqlDatabases);
+
+  const results: string[] = [];
+  let totalFixed = 0;
+  let totalFailed = 0;
+
+  for (const db of databasesToFix) {
+    const ruleIds = args.ruleIds ?? ["EH-002", "EH-004", "EH-005"];
+
+    for (const ruleId of ruleIds) {
+      let commands: string[] = [];
+
+      if (ruleId === "EH-002" && args.tableName) {
+        // Fix fragmentation: merge table
+        commands = [`.merge table ['${args.tableName}']`];
+      } else if (ruleId === "EH-002" && !args.tableName) {
+        // Find fragmented tables and merge them
+        const extents = await runKqlDiagnostics(queryUri, db.displayName, {
+          ext: { query: `.show database extents | summarize ExtentCount=count(), TotalRows=sum(RowCount) by TableName | where ExtentCount > 100 and TotalRows/ExtentCount < 100000`, isMgmt: true },
+        });
+        const fragmented = extents.ext?.rows ?? [];
+        commands = fragmented.map(r => `.merge table ['${r.TableName}']`);
+      }
+
+      if (ruleId === "EH-004") {
+        const days = args.cachingDays ?? 30;
+        if (args.tableName) {
+          commands = [`.alter table ['${args.tableName}'] policy caching hot = ${days}d`];
+        } else {
+          commands = [`.alter database ['${db.displayName}'] policy caching hot = ${days}d`];
+        }
+      }
+
+      if (ruleId === "EH-005") {
+        const days = args.retentionDays ?? 365;
+        if (args.tableName) {
+          commands = [`.alter table ['${args.tableName}'] policy retention softdelete = ${days}d`];
+        } else {
+          commands = [`.alter database ['${db.displayName}'] policy retention softdelete = ${days}d`];
+        }
+      }
+
+      for (const cmd of commands) {
+        try {
+          await executeKqlMgmt(queryUri, db.displayName, cmd);
+          results.push(`| ${ruleId} | ✅ | ${db.displayName} | \`${cmd.substring(0, 80)}\` |`);
+          totalFixed++;
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          results.push(`| ${ruleId} | ❌ | ${db.displayName}: ${msg.substring(0, 60)} | \`${cmd.substring(0, 60)}\` |`);
+          totalFailed++;
+        }
+      }
+    }
+  }
+
+  return [
+    `# 🔧 Eventhouse Fix: ${eventhouse.displayName}`,
+    "",
+    `_Applying fixes at ${new Date().toISOString()}_`,
+    "",
+    `**${totalFixed} fixed, ${totalFailed} failed**`,
+    "",
+    "| Rule | Status | Database | Command |",
+    "|------|--------|----------|---------|",
+    ...results,
+  ].join("\n");
+}
+
+// ──────────────────────────────────────────────
 // Tool definitions for MCP registration
 // ──────────────────────────────────────────────
 
@@ -584,5 +678,26 @@ export const eventhouseTools = [
       required: ["workspaceId", "eventhouseId"],
     },
     handler: eventhouseOptimizationRecommendations,
+  },
+  {
+    name: "eventhouse_fix",
+    description:
+      "AUTO-FIX: Applies fixes to a Fabric Eventhouse. " +
+      "Can fix: extent fragmentation (merge), caching policy, retention policy. " +
+      "Specify ruleIds, optional tableName, cachingDays, retentionDays.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        workspaceId: { type: "string", description: "The ID of the Fabric workspace" },
+        eventhouseId: { type: "string", description: "The ID of the eventhouse to fix" },
+        ruleIds: { type: "array", items: { type: "string" }, description: "Rule IDs to fix: EH-002 (merge), EH-004 (caching), EH-005 (retention)" },
+        kqlDatabaseName: { type: "string", description: "Optional: specific KQL database name" },
+        tableName: { type: "string", description: "Optional: specific table name" },
+        cachingDays: { type: "number", description: "Hot cache days (default: 30)" },
+        retentionDays: { type: "number", description: "Retention days (default: 365)" },
+      },
+      required: ["workspaceId", "eventhouseId"],
+    },
+    handler: eventhouseFix,
   },
 ];
