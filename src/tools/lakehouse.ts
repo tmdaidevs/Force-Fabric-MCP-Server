@@ -7,6 +7,7 @@ import {
   getWorkspace,
   runTemporaryNotebook,
 } from "../clients/fabricClient.js";
+import { runSparkFixesViaLivy } from "../clients/livyClient.js";
 import { runDiagnosticQueries } from "../clients/sqlClient.js";
 import type { FabricLakehouse, LakehouseTable } from "../clients/fabricClient.js";
 import type { SqlRow } from "../clients/sqlClient.js";
@@ -1030,11 +1031,110 @@ const LAKEHOUSE_FIX_COMMANDS: Record<string, {
       `spark.sql("ALTER TABLE \`${lh}\`.\`${t}\` SET TBLPROPERTIES ('delta.dataSkippingNumIndexedCols' = '32')")\nprint("✅ Data skipping enabled for ${t}")`,
   },
   "audit-columns": {
-    description: "Add created_at and updated_at audit columns",
+    description: "Add created_at and updated_at audit columns (idempotent)",
     getCode: (lh, t) =>
-      `from pyspark.sql.functions import current_timestamp\nspark.sql("ALTER TABLE \`${lh}\`.\`${t}\` ADD COLUMNS (created_at TIMESTAMP, updated_at TIMESTAMP)")\nprint("✅ Audit columns added to ${t}")`,
+      `existing = [c.name.lower() for c in spark.table("\`${lh}\`.\`${t}\`").schema]\nadded = []\nif "created_at" not in existing:\n    spark.sql("ALTER TABLE \`${lh}\`.\`${t}\` ADD COLUMNS (created_at TIMESTAMP)")\n    added.append("created_at")\nif "updated_at" not in existing:\n    spark.sql("ALTER TABLE \`${lh}\`.\`${t}\` ADD COLUMNS (updated_at TIMESTAMP)")\n    added.append("updated_at")\nif added:\n    print(f"✅ Added {', '.join(added)} to ${t}")\nelse:\n    print("✅ Audit columns already exist on ${t} - skipped")`,
   },
 };
+
+// ──────────────────────────────────────────────
+// Tool: lakehouse_auto_optimize — Fix ALL tables via single Livy session
+// ──────────────────────────────────────────────
+
+export async function lakehouseAutoOptimize(args: {
+  workspaceId: string;
+  lakehouseId: string;
+  fixIds?: string[];
+  dryRun?: boolean;
+}): Promise<string> {
+  const lakehouse = await getLakehouse(args.workspaceId, args.lakehouseId);
+  const lhName = lakehouse.displayName;
+  validateSparkName(lhName, "lakehouse name");
+  const isDryRun = args.dryRun ?? false;
+  const fixIds = args.fixIds ?? ["auto-optimize", "retention", "data-skipping"];
+
+  // Discover all Delta tables
+  const allTables = await listLakehouseTables(args.workspaceId, args.lakehouseId);
+  const deltaTables = allTables.filter(
+    (t: LakehouseTable) => (t.format ?? "").toLowerCase() === "delta"
+  );
+
+  if (deltaTables.length === 0) {
+    return `# 🔧 Lakehouse Auto-Optimize: ${lhName}\n\nNo Delta tables found. Nothing to optimize.`;
+  }
+
+  // Build commands for every table × every fix
+  const commands: Array<{ table: string; fixId: string; description: string; code: string }> = [];
+  for (const t of deltaTables) {
+    validateSparkName(t.name, "table name");
+    for (const fixId of fixIds) {
+      const fix = LAKEHOUSE_FIX_COMMANDS[fixId];
+      if (!fix) continue;
+      commands.push({
+        table: t.name,
+        fixId,
+        description: fix.description,
+        code: fix.getCode(lhName, t.name),
+      });
+    }
+  }
+
+  // Dry-run: preview only
+  if (isDryRun) {
+    const lines = [
+      `# 🔧 Lakehouse Auto-Optimize: ${lhName}`,
+      "",
+      `_DRY RUN at ${new Date().toISOString()}_`,
+      "",
+      `**${deltaTables.length} tables × ${fixIds.length} fixes = ${commands.length} commands previewed**`,
+      "",
+      "| Table | Fix | Description |",
+      "|-------|-----|-------------|",
+    ];
+    for (const cmd of commands) {
+      lines.push(`| ${cmd.table} | ${cmd.fixId} | ${cmd.description} |`);
+    }
+    lines.push("", "> 💡 Set `dryRun: false` to execute via Livy API.");
+    return lines.join("\n");
+  }
+
+  // Execute via single Livy session
+  const lines = [
+    `# 🔧 Lakehouse Auto-Optimize: ${lhName}`,
+    "",
+    `_Executed at ${new Date().toISOString()} via Livy API_`,
+    "",
+  ];
+
+  try {
+    const { results } = await runSparkFixesViaLivy(
+      args.workspaceId,
+      args.lakehouseId,
+      commands
+    );
+
+    const passed = results.filter(r => r.status === "ok").length;
+    const failed = results.length - passed;
+
+    lines.push(
+      `**${passed} succeeded, ${failed} failed** across ${deltaTables.length} tables`,
+      "",
+      "| Table | Fix | Status | Detail |",
+      "|-------|-----|--------|--------|",
+    );
+
+    for (const r of results) {
+      const icon = r.status === "ok" ? "✅" : "❌";
+      const detail = r.status === "ok" ? (r.output ?? "OK") : (r.error ?? "Failed");
+      lines.push(`| ${r.table} | ${r.fixId} | ${icon} | ${detail} |`);
+    }
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    lines.push(`**❌ Livy session failed**: ${msg}`);
+  }
+
+  return lines.join("\n");
+}
 
 export async function lakehouseFix(args: {
   workspaceId: string;
@@ -1053,19 +1153,17 @@ export async function lakehouseFix(args: {
 
   validateSparkName(lhName, "lakehouse name");
 
-  const codeBlocks: string[] = [];
   const fixDescriptions: { id: string; description: string; code: string }[] = [];
 
   for (const fixId of fixIds) {
     const fix = LAKEHOUSE_FIX_COMMANDS[fixId];
     if (fix) {
       const code = fix.getCode(lhName, args.tableName);
-      codeBlocks.push(code);
       fixDescriptions.push({ id: fixId, description: fix.description, code });
     }
   }
 
-  if (codeBlocks.length === 0) {
+  if (fixDescriptions.length === 0) {
     return "❌ No valid fix IDs provided. Available: auto-optimize, retention, data-skipping, audit-columns";
   }
 
@@ -1084,30 +1182,69 @@ export async function lakehouseFix(args: {
     for (const f of fixDescriptions) {
       lines.push(`| ${f.id} | 🔍 ${f.description} | \`${f.code.substring(0, 80)}...\` |`);
     }
-    lines.push("", "> 💡 Set `dryRun: false` to execute these commands via temporary Notebook.");
+    lines.push("", "> 💡 Set `dryRun: false` to execute these commands via Livy API.");
     return lines.join("\n");
   }
 
-  const code = codeBlocks.join("\n\n");
-  const result = await runTemporaryNotebook(args.workspaceId, code);
+  // Build commands for Livy
+  const commands = fixDescriptions.map((f) => ({
+    table: args.tableName,
+    fixId: f.id,
+    description: f.description,
+    code: f.code,
+  }));
+
+  // Try Livy API first (no notebook needed)
+  let usedMethod = "Livy API";
+  let fixResults: Array<{ id: string; description: string; status: string; detail: string }> = [];
+
+  try {
+    const { results } = await runSparkFixesViaLivy(
+      args.workspaceId,
+      args.lakehouseId,
+      commands
+    );
+
+    for (const r of results) {
+      fixResults.push({
+        id: r.fixId,
+        description: r.description,
+        status: r.status === "ok" ? "✅" : "❌",
+        detail: r.status === "ok" ? (r.output ?? "OK") : (r.error ?? "Failed"),
+      });
+    }
+  } catch (livyError) {
+    // Livy failed — fall back to notebook approach
+    usedMethod = "Notebook (Livy fallback)";
+
+    const code = fixDescriptions.map((f) => f.code).join("\n\n");
+    const result = await runTemporaryNotebook(args.workspaceId, code);
+
+    for (const f of fixDescriptions) {
+      fixResults.push({
+        id: f.id,
+        description: f.description,
+        status: result.status === "Completed" ? "✅" : "❌",
+        detail: result.status === "Completed" ? "OK" : (result.error ?? "Failed"),
+      });
+    }
+  }
+
+  const allOk = fixResults.every((r) => r.status === "✅");
 
   const lines = [
     `# 🔧 Lakehouse Fix: ${lhName}.${args.tableName}`,
     "",
-    `_Executed at ${new Date().toISOString()}_`,
+    `_Executed at ${new Date().toISOString()} via ${usedMethod}_`,
     "",
-    `**Status**: ${result.status === "Completed" ? "✅ Success" : `❌ ${result.status}`}`,
+    `**Status**: ${allOk ? "✅ Success" : "⚠️ Partial/Failed"}`,
     "",
-    "| Fix | Status |",
-    "|-----|--------|",
+    "| Fix | Status | Detail |",
+    "|-----|--------|--------|",
   ];
 
-  for (const f of fixDescriptions) {
-    lines.push(`| ${f.id} ${f.description} | ${result.status === "Completed" ? "✅" : "❌"} ${result.error ?? ""} |`);
-  }
-
-  if (result.error) {
-    lines.push("", `**Error**: ${result.error}`);
+  for (const f of fixResults) {
+    lines.push(`| ${f.id} ${f.description} | ${f.status} | ${f.detail} |`);
   }
 
   return lines.join("\n");
@@ -1255,9 +1392,9 @@ export const lakehouseTools = [
   {
     name: "lakehouse_fix",
     description:
-      "AUTO-FIX: Applies Spark SQL fixes to a Lakehouse via a temporary Notebook. " +
+      "AUTO-FIX: Applies Spark SQL fixes to a Lakehouse via Livy API (no notebooks needed). " +
+      "Falls back to temporary Notebook if Livy is unavailable. " +
       "Can fix: auto-optimize, retention policy, data skipping, audit columns. " +
-      "Creates a temp notebook, runs it, polls for completion, then deletes it. " +
       "Use dryRun=true to preview commands without executing them. " +
       "Available fixIds: auto-optimize, retention, data-skipping, audit-columns.",
     inputSchema: {
@@ -1278,5 +1415,30 @@ export const lakehouseTools = [
       required: ["workspaceId", "lakehouseId", "tableName"],
     },
     handler: lakehouseFix,
+  },
+  {
+    name: "lakehouse_auto_optimize",
+    description:
+      "AUTO-OPTIMIZE: Discovers ALL Delta tables in a Lakehouse and applies fixes to every table " +
+      "in a single Livy Spark session (no notebooks needed). " +
+      "Default fixes: auto-optimize, retention, data-skipping. " +
+      "Use dryRun=true to preview. Use fixIds to select specific fixes.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        workspaceId: { type: "string", description: "The ID of the Fabric workspace" },
+        lakehouseId: { type: "string", description: "The ID of the lakehouse" },
+        fixIds: {
+          type: "array", items: { type: "string" },
+          description: "Fix IDs: auto-optimize, retention, data-skipping, audit-columns. Default: first three.",
+        },
+        dryRun: {
+          type: "boolean",
+          description: "If true, preview commands without executing (default: false)",
+        },
+      },
+      required: ["workspaceId", "lakehouseId"],
+    },
+    handler: lakehouseAutoOptimize,
   },
 ];

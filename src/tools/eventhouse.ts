@@ -870,6 +870,27 @@ export async function eventhouseFix(args: {
 }
 
 // ──────────────────────────────────────────────
+// Tool: eventhouse_auto_optimize — Scan + fix all issues
+// ──────────────────────────────────────────────
+
+export async function eventhouseAutoOptimize(args: {
+  workspaceId: string;
+  eventhouseId: string;
+  cachingDays?: number;
+  retentionDays?: number;
+  dryRun?: boolean;
+}): Promise<string> {
+  return eventhouseFix({
+    workspaceId: args.workspaceId,
+    eventhouseId: args.eventhouseId,
+    ruleIds: undefined, // all rules
+    cachingDays: args.cachingDays,
+    retentionDays: args.retentionDays,
+    dryRun: args.dryRun,
+  });
+}
+
+// ──────────────────────────────────────────────
 // Tool definitions for MCP registration
 // ──────────────────────────────────────────────
 
@@ -950,5 +971,27 @@ export const eventhouseTools = [
       required: ["workspaceId", "eventhouseId"],
     },
     handler: eventhouseFix,
+  },
+  {
+    name: "eventhouse_auto_optimize",
+    description:
+      "AUTO-OPTIMIZE: Scans a Fabric Eventhouse for all fixable issues across all KQL databases and applies fixes. " +
+      "Covers: merge fragmentation, caching policies, retention policies, materialized views, " +
+      "ingestion batching, partitioning, merge policy. Use dryRun=true to preview.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        workspaceId: { type: "string", description: "The ID of the Fabric workspace" },
+        eventhouseId: { type: "string", description: "The ID of the eventhouse to optimize" },
+        cachingDays: { type: "number", description: "Hot cache days (default: 30)" },
+        retentionDays: { type: "number", description: "Retention days (default: 365)" },
+        dryRun: {
+          type: "boolean",
+          description: "If true, preview KQL commands without executing (default: false)",
+        },
+      },
+      required: ["workspaceId", "eventhouseId"],
+    },
+    handler: eventhouseAutoOptimize,
   },
 ];

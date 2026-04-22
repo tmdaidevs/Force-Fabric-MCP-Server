@@ -1265,6 +1265,24 @@ export async function warehouseFix(args: {
 }
 
 // ──────────────────────────────────────────────
+// Tool: warehouse_auto_optimize — Scan + fix all issues
+// ──────────────────────────────────────────────
+
+export async function warehouseAutoOptimize(args: {
+  workspaceId: string;
+  warehouseId: string;
+  dryRun?: boolean;
+}): Promise<string> {
+  // Run the existing fix handler with all rules — it already runs diagnostics internally
+  return warehouseFix({
+    workspaceId: args.workspaceId,
+    warehouseId: args.warehouseId,
+    ruleIds: undefined, // all rules
+    dryRun: args.dryRun,
+  });
+}
+
+// ──────────────────────────────────────────────
 // Tool definitions for MCP registration
 // ──────────────────────────────────────────────
 
@@ -1362,5 +1380,25 @@ export const warehouseTools = [
       required: ["workspaceId", "warehouseId"],
     },
     handler: warehouseFix,
+  },
+  {
+    name: "warehouse_auto_optimize",
+    description:
+      "AUTO-OPTIMIZE: Scans a Fabric Warehouse for all fixable issues and applies all safe fixes automatically. " +
+      "Runs diagnostics first, then applies: stale statistics refresh, PK constraints, ANSI settings, " +
+      "result set caching, snapshot isolation, and more. Use dryRun=true to preview.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        workspaceId: { type: "string", description: "The ID of the Fabric workspace" },
+        warehouseId: { type: "string", description: "The ID of the warehouse to optimize" },
+        dryRun: {
+          type: "boolean",
+          description: "If true, preview SQL commands without executing (default: false)",
+        },
+      },
+      required: ["workspaceId", "warehouseId"],
+    },
+    handler: warehouseAutoOptimize,
   },
 ];

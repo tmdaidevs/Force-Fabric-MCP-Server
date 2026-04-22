@@ -1051,6 +1051,55 @@ export async function semanticModelFix(args: {
 }
 
 // ──────────────────────────────────────────────
+// Tool: semantic_model_auto_optimize — Apply all safe fixes
+// ──────────────────────────────────────────────
+
+export async function semanticModelAutoOptimize(args: {
+  workspaceId: string;
+  semanticModelId: string;
+  dryRun?: boolean;
+}): Promise<string> {
+  if (args.dryRun) {
+    // Dry-run: show what would be applied
+    const models = await listSemanticModels(args.workspaceId);
+    const model = models.find(m => m.id === args.semanticModelId);
+    const modelName = model?.displayName ?? args.semanticModelId;
+
+    const allRules = ["SM-FIX-FORMAT", "SM-FIX-DESC", "SM-FIX-HIDDEN", "SM-FIX-DATE", "SM-FIX-KEY", "SM-FIX-AUTODATE"];
+    const descriptions: Record<string, string> = {
+      "SM-FIX-FORMAT": "Add format strings to measures (currency, %, decimal)",
+      "SM-FIX-DESC": "Add descriptions to visible tables",
+      "SM-FIX-HIDDEN": "Set IsAvailableInMDX=false on hidden columns",
+      "SM-FIX-DATE": "Mark date/calendar tables with Time dataCategory",
+      "SM-FIX-KEY": "Set IsKey=true on relationship PK columns",
+      "SM-FIX-AUTODATE": "Remove orphaned auto-date tables",
+    };
+
+    const lines = [
+      `# 🔧 Semantic Model Auto-Optimize: ${modelName}`,
+      "",
+      `_DRY RUN at ${new Date().toISOString()}_`,
+      "",
+      `**${allRules.length} fixes will be evaluated and applied where applicable:**`,
+      "",
+      "| Rule | Description |",
+      "|------|-------------|",
+    ];
+    for (const r of allRules) {
+      lines.push(`| ${r} | ${descriptions[r]} |`);
+    }
+    lines.push("", "> 💡 Set `dryRun: false` to apply all safe fixes.");
+    return lines.join("\n");
+  }
+
+  return semanticModelFix({
+    workspaceId: args.workspaceId,
+    semanticModelId: args.semanticModelId,
+    ruleIds: undefined, // all rules
+  });
+}
+
+// ──────────────────────────────────────────────
 // Tool definitions for MCP registration
 // ──────────────────────────────────────────────
 
@@ -1110,5 +1159,26 @@ export const semanticModelTools = [
       required: ["workspaceId", "semanticModelId"],
     },
     handler: semanticModelFix,
+  },
+  {
+    name: "semantic_model_auto_optimize",
+    description:
+      "AUTO-OPTIMIZE: Downloads a Semantic Model definition and applies all safe fixes automatically. " +
+      "Covers: format strings on measures, descriptions on tables, IsAvailableInMDX on hidden columns, " +
+      "date table marking, IsKey on PK columns, remove orphaned auto-date tables. " +
+      "Use dryRun=true to preview.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        workspaceId: { type: "string", description: "The ID of the Fabric workspace" },
+        semanticModelId: { type: "string", description: "The ID of the semantic model to optimize" },
+        dryRun: {
+          type: "boolean",
+          description: "If true, preview fixes without applying (default: false)",
+        },
+      },
+      required: ["workspaceId", "semanticModelId"],
+    },
+    handler: semanticModelAutoOptimize,
   },
 ];
