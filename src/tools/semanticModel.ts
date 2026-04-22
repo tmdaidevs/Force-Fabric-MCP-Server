@@ -36,8 +36,17 @@ const DAX_DIAGNOSTICS = {
   columnStats: "EVALUATE COLUMNSTATISTICS()",
 };
 
+// INFO DAX functions — work on ALL model types including DirectLake and DirectQuery
+const INFO_QUERIES = {
+  tables: "EVALUATE INFO.TABLES()",
+  columns: "EVALUATE INFO.COLUMNS()",
+  measures: "EVALUATE INFO.MEASURES()",
+  relationships: "EVALUATE INFO.RELATIONSHIPS()",
+  partitions: "EVALUATE INFO.PARTITIONS()",
+};
+
 // DMV queries via executeQueries REST API
-// MDSCHEMA_* and DBSCHEMA_* work; TMSCHEMA_* and DISCOVER_* are blocked
+// MDSCHEMA_* and DBSCHEMA_* work; TMSCHEMA_* and DISCOVER_* may be blocked on REST
 const DMV_QUERIES = {
   // Tables & structure (via MDSCHEMA)
   measureGroupDimensions: `SELECT [MEASUREGROUP_NAME],[DIMENSION_UNIQUE_NAME],[DIMENSION_CARDINALITY],[DIMENSION_IS_VISIBLE] FROM $SYSTEM.MDSCHEMA_MEASUREGROUP_DIMENSIONS WHERE [CUBE_NAME]='Model'`,
@@ -493,13 +502,19 @@ export async function semanticModelOptimizationRecommendations(args: {
     try { return await executeSemanticModelQuery(args.workspaceId, args.semanticModelId, q); } catch { return []; }
   };
 
-  // ── Run DMV + DAX queries in parallel ──
-  const [dmvMGDims, dmvDimensions, dmvMeasures, dmvHierarchies, columnStatsRaw] = await Promise.all([
+  // ── Run DMV + DAX + INFO queries in parallel ──
+  const [dmvMGDims, dmvDimensions, dmvMeasures, dmvHierarchies, columnStatsRaw,
+         infoTables, infoColumns, infoMeasures, infoRelationships, infoPartitions] = await Promise.all([
     runQuery(DMV_QUERIES.measureGroupDimensions),
     runQuery(DMV_QUERIES.dimensions),
     runQuery(DMV_QUERIES.measures),
     runQuery(DMV_QUERIES.hierarchies),
     runQuery(DAX_DIAGNOSTICS.columnStats),
+    runQuery(INFO_QUERIES.tables),
+    runQuery(INFO_QUERIES.columns),
+    runQuery(INFO_QUERIES.measures),
+    runQuery(INFO_QUERIES.relationships),
+    runQuery(INFO_QUERIES.partitions),
   ]);
 
   const columnStats = parseColumnStatistics(columnStatsRaw);
@@ -526,6 +541,13 @@ export async function semanticModelOptimizationRecommendations(args: {
   );
   const allMeasures = dmvMeasures.filter(m => m.MEASURE_NAME !== "__Default measure");
 
+  // ── Detect storage mode from INFO.PARTITIONS ──
+  const storageMode = infoPartitions.length > 0
+    ? (infoPartitions.some(p => String(p.Mode ?? p.mode ?? "").toLowerCase().includes("directlake")) ? "DirectLake"
+       : infoPartitions.some(p => String(p.Mode ?? p.mode ?? "").toLowerCase().includes("directquery")) ? "DirectQuery"
+       : "Import")
+    : "Unknown";
+
   // ── Header ──
   header.push(
     "## 🔌 Model Info",
@@ -533,9 +555,16 @@ export async function semanticModelOptimizationRecommendations(args: {
     `- **Tables**: ${tableNames.size}`,
     `- **Measures**: ${allMeasures.length} (${userMeasures.length} visible)`,
     `- **Hierarchies**: ${dmvHierarchies.length}`,
+    `- **Storage Mode**: ${storageMode}`,
     `- **COLUMNSTATISTICS**: ${columnStats.length > 0 ? `${columnStats.length} columns analyzed` : "Not available (DirectLake/DirectQuery)"}`,
-    "",
   );
+  if (infoColumns.length > 0) {
+    header.push(
+      `- **Columns** (INFO): ${infoColumns.length}`,
+      `- **Relationships**: ${infoRelationships.length}`,
+    );
+  }
+  header.push("");
 
   // Add overview tables if COLUMNSTATISTICS available
   if (columnStats.length > 0) {
@@ -827,6 +856,218 @@ export async function semanticModelOptimizationRecommendations(args: {
           recommendation: matches[0].recommendation,
         });
       }
+    }
+  }
+
+  // ══════════════════════════════════════════════
+  // METADATA-BASED BPA (works on ALL models including DirectLake)
+  // Falls back when COLUMNSTATISTICS is not available
+  // ══════════════════════════════════════════════
+  if (columnStats.length === 0 && infoColumns.length > 0) {
+    // Build table ID → name lookup
+    const tableIdToName = new Map<string, string>();
+    for (const t of infoTables) {
+      tableIdToName.set(String(t.ID ?? t.id ?? ""), String(t.Name ?? t.name ?? ""));
+    }
+    function getTableName(tableId: unknown): string {
+      return tableIdToName.get(String(tableId ?? "")) ?? String(tableId ?? "unknown");
+    }
+
+    // Helper to get column display name
+    function getColName(c: Record<string, unknown>): string {
+      return (c.ExplicitName as string ?? c.Name as string ?? c.name as string ?? "");
+    }
+
+    // Helper to get column data type
+    function getColDataType(c: Record<string, unknown>): number {
+      return Number(c.ExplicitDataType ?? c.DataType ?? c.dataType ?? 0);
+    }
+
+    // Filter out private/system tables
+    const visibleTableIds = new Set<string>();
+    for (const t of infoTables) {
+      const isPrivate = t.IsPrivate ?? t.isPrivate;
+      if (!isPrivate) {
+        visibleTableIds.add(String(t.ID ?? t.id ?? ""));
+      }
+    }
+    const userColumns = infoColumns.filter(c =>
+      visibleTableIds.has(String(c.TableID ?? c.tableID ?? ""))
+    );
+
+    header.push(
+      `## 📋 Metadata-Based Analysis (${storageMode} mode)`,
+      "",
+      `INFO.COLUMNS() returned ${userColumns.length} columns across ${visibleTableIds.size} user tables.`,
+      "",
+    );
+
+    // SM-B02: Description/Comment Column (by name pattern)
+    const descColumns = userColumns.filter(c => {
+      const name = getColName(c).toLowerCase();
+      return name.includes("description") || name.includes("comment") || name.includes("remark") || name.includes("note");
+    });
+    if (descColumns.length === 0) {
+      rules.push({ id: "SM-B02", rule: "Description/Comment Column", category: "Data Types", severity: "HIGH", status: "PASS", details: "No description/comment columns detected by name." });
+    } else {
+      const locs = descColumns.slice(0, 5).map(c => `${getTableName(c.TableID ?? c.tableID)}[${getColName(c)}]`);
+      rules.push({
+        id: "SM-B02", rule: "Description/Comment Column", category: "Data Types", severity: "HIGH",
+        status: "FAIL",
+        details: `${descColumns.length} column(s) with description/comment names: ${locs.join(", ")}${descColumns.length > 5 ? ` +${descColumns.length - 5} more` : ""}`,
+        recommendation: "Remove from model unless specifically needed for searching/display. Description fields rarely add analytical value but drastically increase model size.",
+      });
+    }
+
+    // SM-B03: GUID/UUID Column (by name pattern)
+    const guidColumns = userColumns.filter(c => {
+      const name = getColName(c).toLowerCase();
+      return name.includes("guid") || name.includes("uuid") || name === "correlation_id" || name === "request_id";
+    });
+    if (guidColumns.length === 0) {
+      rules.push({ id: "SM-B03", rule: "GUID/UUID Column in Model", category: "Data Types", severity: "HIGH", status: "PASS", details: "No GUID/UUID columns detected by name." });
+    } else {
+      const locs = guidColumns.slice(0, 5).map(c => `${getTableName(c.TableID ?? c.tableID)}[${getColName(c)}]`);
+      rules.push({
+        id: "SM-B03", rule: "GUID/UUID Column in Model", category: "Data Types", severity: "HIGH",
+        status: "FAIL",
+        details: `${guidColumns.length} GUID/UUID column(s): ${locs.join(", ")}${guidColumns.length > 5 ? ` +${guidColumns.length - 5} more` : ""}`,
+        recommendation: "Replace with integer surrogate keys for relationships. Hide or remove the GUID column from the model.",
+      });
+    }
+
+    // SM-B05: Boolean as Text (string columns with boolean-like names)
+    const boolTextColumns = userColumns.filter(c => {
+      const dt = getColDataType(c);
+      const name = getColName(c).toLowerCase();
+      return dt === 2 && (name.includes("is_") || name.startsWith("has_") || name.startsWith("flag") || name.includes("_flag") || name.includes("active") || name.includes("enabled"));
+    });
+    if (boolTextColumns.length === 0) {
+      rules.push({ id: "SM-B05", rule: "Boolean Stored as Text", category: "Data Types", severity: "MEDIUM", status: "PASS", details: "No boolean-as-text columns detected." });
+    } else {
+      const locs = boolTextColumns.slice(0, 5).map(c => `${getTableName(c.TableID ?? c.tableID)}[${getColName(c)}]`);
+      rules.push({
+        id: "SM-B05", rule: "Boolean Stored as Text", category: "Data Types", severity: "MEDIUM",
+        status: "WARN",
+        details: `${boolTextColumns.length} string column(s) with boolean-like names: ${locs.join(", ")}${boolTextColumns.length > 5 ? ` +${boolTextColumns.length - 5} more` : ""}`,
+        recommendation: "Convert to TRUE/FALSE in Power Query: = Table.TransformColumnTypes(#\"Prev Step\", {{\"ColumnName\", type logical}})",
+      });
+    }
+
+    // SM-B06: Date as Text (string columns with date-like names)
+    const dateTextColumns = userColumns.filter(c => {
+      const dt = getColDataType(c);
+      const name = getColName(c).toLowerCase();
+      return dt === 2 && (name.includes("date") || name.includes("time") || name.endsWith("_at") || name.endsWith("_ts") || name.includes("created") || name.includes("modified"));
+    });
+    if (dateTextColumns.length === 0) {
+      rules.push({ id: "SM-B06", rule: "Date Stored as Text", category: "Data Types", severity: "MEDIUM", status: "PASS", details: "No date-as-text columns detected." });
+    } else {
+      const locs = dateTextColumns.slice(0, 5).map(c => `${getTableName(c.TableID ?? c.tableID)}[${getColName(c)}]`);
+      rules.push({
+        id: "SM-B06", rule: "Date Stored as Text", category: "Data Types", severity: "MEDIUM",
+        status: "WARN",
+        details: `${dateTextColumns.length} string column(s) with date-like names: ${locs.join(", ")}${dateTextColumns.length > 5 ? ` +${dateTextColumns.length - 5} more` : ""}`,
+        recommendation: "Convert to Date/DateTime type for proper time intelligence, sorting, and filtering. Text dates break DATEADD, SAMEPERIODLASTYEAR, etc.",
+      });
+    }
+
+    // SM-B07: Numeric as Text (string columns with numeric-like names)
+    const numTextColumns = userColumns.filter(c => {
+      const dt = getColDataType(c);
+      const name = getColName(c).toLowerCase();
+      return dt === 2 && (name.includes("amount") || name.includes("price") || name.includes("cost") || name.includes("qty") || name.includes("quantity") || name.includes("total") || name.includes("count") || name.includes("num"));
+    });
+    if (numTextColumns.length === 0) {
+      rules.push({ id: "SM-B07", rule: "Numeric Column Stored as Text", category: "Data Types", severity: "MEDIUM", status: "PASS", details: "No numeric-as-text columns detected." });
+    } else {
+      const locs = numTextColumns.slice(0, 5).map(c => `${getTableName(c.TableID ?? c.tableID)}[${getColName(c)}]`);
+      rules.push({
+        id: "SM-B07", rule: "Numeric Column Stored as Text", category: "Data Types", severity: "MEDIUM",
+        status: "WARN",
+        details: `${numTextColumns.length} string column(s) with numeric-like names: ${locs.join(", ")}${numTextColumns.length > 5 ? ` +${numTextColumns.length - 5} more` : ""}`,
+        recommendation: "Convert to Whole Number or Decimal Number in Power Query for proper aggregation.",
+      });
+    }
+
+    // SM-B08: String Keys (string columns ending in key/_id/id)
+    const stringKeyColumns = userColumns.filter(c => {
+      const dt = getColDataType(c);
+      const name = getColName(c).toLowerCase();
+      return dt === 2 && (name.endsWith("key") || name.endsWith("_id") || name.endsWith("id"));
+    });
+    if (stringKeyColumns.length === 0) {
+      rules.push({ id: "SM-B08", rule: "String Keys Instead of Integer Surrogate Keys", category: "Data Types", severity: "MEDIUM", status: "PASS", details: "No string key columns detected." });
+    } else {
+      const locs = stringKeyColumns.slice(0, 5).map(c => `${getTableName(c.TableID ?? c.tableID)}[${getColName(c)}]`);
+      rules.push({
+        id: "SM-B08", rule: "String Keys Instead of Integer Surrogate Keys", category: "Data Types", severity: "MEDIUM",
+        status: "WARN",
+        details: `${stringKeyColumns.length} string column(s) used as keys: ${locs.join(", ")}${stringKeyColumns.length > 5 ? ` +${stringKeyColumns.length - 5} more` : ""}`,
+        recommendation: "Create integer surrogate keys in the data source, use those for relationships, and hide the string natural keys from the model.",
+      });
+    }
+
+    // SM-B09/B10: Wide / Extremely Wide Table (count columns per table)
+    const tableColumnCounts = new Map<string, number>();
+    for (const c of userColumns) {
+      const tblId = String(c.TableID ?? c.tableID ?? "");
+      tableColumnCounts.set(tblId, (tableColumnCounts.get(tblId) ?? 0) + 1);
+    }
+    const wideTables: string[] = [];
+    const extremeWideTables: string[] = [];
+    for (const [tblId, count] of tableColumnCounts) {
+      const tblName = getTableName(tblId);
+      if (count > 100) extremeWideTables.push(`${tblName} (${count} cols)`);
+      else if (count > 30) wideTables.push(`${tblName} (${count} cols)`);
+    }
+    rules.push({
+      id: "SM-B09", rule: "Wide Table", category: "Data Types", severity: "MEDIUM",
+      status: wideTables.length === 0 ? "PASS" : "WARN",
+      details: wideTables.length === 0
+        ? "No wide tables (>30 columns) detected."
+        : `${wideTables.length} wide table(s): ${wideTables.slice(0, 5).join(", ")}${wideTables.length > 5 ? ` +${wideTables.length - 5} more` : ""}`,
+      recommendation: "Remove columns not used in any measure, relationship, visual, or RLS. Each removed column reduces memory and refresh time.",
+    });
+    rules.push({
+      id: "SM-B10", rule: "Extremely Wide Table", category: "Data Types", severity: "HIGH",
+      status: extremeWideTables.length === 0 ? "PASS" : "FAIL",
+      details: extremeWideTables.length === 0
+        ? "No extremely wide tables (>100 columns) detected."
+        : `${extremeWideTables.length} table(s): ${extremeWideTables.slice(0, 5).join(", ")}${extremeWideTables.length > 5 ? ` +${extremeWideTables.length - 5} more` : ""}`,
+      recommendation: "Remove all columns not actively used in visuals, measures, or relationships. Use Tabular Editor to audit column usage.",
+    });
+
+    // SM-B12: Single Column Table
+    const singleColTables: string[] = [];
+    for (const [tblId, count] of tableColumnCounts) {
+      if (count === 1) singleColTables.push(getTableName(tblId));
+    }
+    rules.push({
+      id: "SM-B12", rule: "Single Column Table", category: "Data Types", severity: "LOW",
+      status: singleColTables.length === 0 ? "PASS" : "WARN",
+      details: singleColTables.length === 0
+        ? "No single-column tables detected."
+        : `${singleColTables.length} table(s) with only 1 column: ${singleColTables.slice(0, 5).join(", ")}${singleColTables.length > 5 ? ` +${singleColTables.length - 5} more` : ""}`,
+      recommendation: "Review if this table is needed. Single-column tables might be better modeled as a disconnected table or measure parameter.",
+    });
+
+    // SM-B13: High-Precision Timestamp (DateTime columns with timestamp-like names)
+    const timestampColumns = userColumns.filter(c => {
+      const dt = getColDataType(c);
+      const name = getColName(c).toLowerCase();
+      return dt === 9 && (name.includes("timestamp") || name.includes("datetime") || name.endsWith("_ts") || name.endsWith("_at"));
+    });
+    if (timestampColumns.length === 0) {
+      rules.push({ id: "SM-B13", rule: "High-Precision Timestamp", category: "Data Types", severity: "MEDIUM", status: "PASS", details: "No high-precision timestamp columns detected." });
+    } else {
+      const locs = timestampColumns.slice(0, 5).map(c => `${getTableName(c.TableID ?? c.tableID)}[${getColName(c)}]`);
+      rules.push({
+        id: "SM-B13", rule: "High-Precision Timestamp", category: "Data Types", severity: "MEDIUM",
+        status: "WARN",
+        details: `${timestampColumns.length} DateTime column(s) with timestamp names (may have excessive precision): ${locs.join(", ")}${timestampColumns.length > 5 ? ` +${timestampColumns.length - 5} more` : ""}`,
+        recommendation: "Truncate to date-only or hour-level granularity. Split into separate Date and Time columns if time detail is needed.",
+      });
     }
   }
 
