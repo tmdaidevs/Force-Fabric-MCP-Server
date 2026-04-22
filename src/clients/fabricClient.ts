@@ -362,7 +362,9 @@ export async function getSemanticModelDefinition(
       }
 
       if (opStatus.status === "Failed") {
-        throw new Error("getDefinition operation failed.");
+        const errorDetail = (opStatus as Record<string, unknown>).error;
+        const errorMsg = errorDetail ? JSON.stringify(errorDetail) : "no detail";
+        throw new Error(`getDefinition operation failed: ${errorMsg}`);
       }
     }
     throw new Error("getDefinition operation timed out.");
@@ -419,7 +421,9 @@ export async function updateSemanticModelDefinition(
 
       if (opStatus.status === "Succeeded") return;
       if (opStatus.status === "Failed") {
-        throw new Error("updateDefinition operation failed.");
+        const errorDetail = (opStatus as Record<string, unknown>).error;
+        const errorMsg = errorDetail ? JSON.stringify(errorDetail) : "no detail";
+        throw new Error(`updateDefinition operation failed: ${errorMsg}`);
       }
     }
     throw new Error("updateDefinition operation timed out.");

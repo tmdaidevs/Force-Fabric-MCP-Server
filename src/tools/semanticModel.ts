@@ -1079,10 +1079,13 @@ export async function semanticModelFix(args: {
 
       // SM-FIX-DESC: Add description to tables without one
       if (ruleIds.includes("SM-FIX-DESC") && !tbl.hasDescription && !tbl.isHidden) {
-        // Insert description after the table declaration line
+        // Insert description after the table declaration line, before lineageTag
+        // TMDL uses 2-tab (8 space) indentation for table-level properties
+        const descLine = `\t\tdescription: Table: ${tbl.name}`;
+        // Insert after "table <name>" line
         tmdlContent = tmdlContent.replace(
-          /^(table\s+.+)$/m,
-          `$1\n\tdescription: Table: ${tbl.name}`
+          /^(table\s+.+\n)/m,
+          `$1${descLine}\n`
         );
         results.push(`| SM-FIX-DESC | ✅ | Added description to table ${tbl.name} |`);
         totalFixed++;
