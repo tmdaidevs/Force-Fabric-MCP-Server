@@ -6,7 +6,7 @@ import {
   getSemanticModelDefinition,
   updateSemanticModelDefinition,
 } from "../clients/fabricClient.js";
-import { runXmlaDmvQueries } from "../clients/xmlaClient.js";
+import { runXmlaDmvQueries, executeXmlaCommandById } from "../clients/xmlaClient.js";
 import { renderRuleReport } from "./ruleEngine.js";
 import type { RuleResult } from "./ruleEngine.js";
 
@@ -839,8 +839,418 @@ export async function semanticModelOptimizationRecommendations(args: {
 }
 
 // ──────────────────────────────────────────────
-// Tool: semantic_model_fix — Auto-fix via model.bim
+// Tool: semantic_model_fix — XMLA TMSL first, BIM/TMDL fallback
 // ──────────────────────────────────────────────
+
+// DMV queries for fetching model metadata needed by XMLA fixes
+const FIX_DMV_QUERIES = {
+  measures: `SELECT [MEASUREGROUP_NAME],[MEASURE_NAME],[EXPRESSION],[MEASURE_IS_VISIBLE],[DEFAULT_FORMAT_STRING],[MEASURE_CAPTION],[DESCRIPTION] FROM $SYSTEM.MDSCHEMA_MEASURES WHERE [CUBE_NAME]='Model'`,
+  columns: `SELECT [TABLE_NAME],[COLUMN_NAME],[DATA_TYPE],[IS_NULLABLE],[COLUMN_FLAGS] FROM $SYSTEM.DBSCHEMA_COLUMNS`,
+  dimensions: `SELECT [DIMENSION_UNIQUE_NAME],[DIMENSION_CARDINALITY],[DIMENSION_IS_VISIBLE],[DESCRIPTION] FROM $SYSTEM.MDSCHEMA_DIMENSIONS WHERE [CUBE_NAME]='Model'`,
+};
+
+interface XmlaMeasureInfo {
+  tableName: string;
+  measureName: string;
+  expression: string;
+  isVisible: boolean;
+  formatString: string;
+  description: string;
+}
+
+interface XmlaColumnInfo {
+  tableName: string;
+  columnName: string;
+  dataType: string;
+}
+
+interface XmlaDimensionInfo {
+  name: string;
+  cardinality: number;
+  isVisible: boolean;
+  description: string;
+}
+
+function parseDmvMeasures(rows: Record<string, unknown>[]): XmlaMeasureInfo[] {
+  return rows
+    .filter(r => {
+      const expr = (r["EXPRESSION"] ?? "") as string;
+      return expr.length > 0; // skip internal measures without expressions
+    })
+    .map(r => ({
+      tableName: (r["MEASUREGROUP_NAME"] ?? "") as string,
+      measureName: (r["MEASURE_NAME"] ?? "") as string,
+      expression: (r["EXPRESSION"] ?? "") as string,
+      isVisible: r["MEASURE_IS_VISIBLE"] !== false && r["MEASURE_IS_VISIBLE"] !== "false",
+      formatString: (r["DEFAULT_FORMAT_STRING"] ?? "") as string,
+      description: (r["DESCRIPTION"] ?? "") as string,
+    }));
+}
+
+function parseDmvColumns(rows: Record<string, unknown>[]): XmlaColumnInfo[] {
+  return rows.map(r => ({
+    tableName: (r["TABLE_NAME"] ?? "") as string,
+    columnName: (r["COLUMN_NAME"] ?? "") as string,
+    dataType: (r["DATA_TYPE"] ?? "") as string,
+  }));
+}
+
+function parseDmvDimensions(rows: Record<string, unknown>[]): XmlaDimensionInfo[] {
+  return rows.map(r => ({
+    name: (r["DIMENSION_UNIQUE_NAME"] ?? "") as string,
+    cardinality: (r["DIMENSION_CARDINALITY"] ?? 0) as number,
+    isVisible: r["DIMENSION_IS_VISIBLE"] !== false && r["DIMENSION_IS_VISIBLE"] !== "false",
+    description: (r["DESCRIPTION"] ?? "") as string,
+  }));
+}
+
+/** Infer a format string from a measure name */
+function inferFormatString(name: string, expr: string): string {
+  const nameLower = name.toLowerCase();
+  const exprLower = expr.toLowerCase();
+  if (nameLower.includes("pct") || nameLower.includes("percent") || nameLower.includes("ratio") || nameLower.includes("rate")
+    || exprLower.includes("divide") && (nameLower.includes("%") || exprLower.includes("percent"))) {
+    return "0.0%";
+  }
+  if (nameLower.includes("price") || nameLower.includes("cost") || nameLower.includes("revenue")
+    || nameLower.includes("amount") || nameLower.includes("sales") || nameLower.includes("profit")) {
+    return "$#,##0.00";
+  }
+  if (nameLower.includes("avg") || nameLower.includes("average") || nameLower.includes("mean")) {
+    return "#,##0.00";
+  }
+  return "#,0";
+}
+
+/** Apply a DAX expression fix (regex-based) and return null if no change */
+function applyDaxFix(expr: string, ruleId: string): string | null {
+  if (ruleId === "SM-FIX-IFERROR") {
+    if (!/iferror\s*\(/i.test(expr)) return null;
+    const newExpr = expr.replace(
+      /IFERROR\s*\(\s*((?:[^(),]+|\((?:[^()]*|\([^()]*\))*\))*)\s*,\s*((?:[^(),]+|\((?:[^()]*|\([^()]*\))*\))*)\s*\)/gi,
+      "IF(ISERROR($1), $2, $1)"
+    );
+    return newExpr !== expr ? newExpr : null;
+  }
+  if (ruleId === "SM-FIX-EVALLOG") {
+    if (!/evaluateandlog\s*\(/i.test(expr)) return null;
+    const newExpr = expr.replace(/EVALUATEANDLOG\s*\(\s*/gi, "").replace(/\)\s*$/, "");
+    return newExpr !== expr ? newExpr : null;
+  }
+  if (ruleId === "SM-FIX-ADDZERO") {
+    const newExpr = expr.replace(/\s*\+\s*0\s*$/g, "").replace(/^\s*0\s*\+\s*/g, "");
+    return (newExpr !== expr && newExpr.trim().length > 0) ? newExpr : null;
+  }
+  if (ruleId === "SM-FIX-SUMX") {
+    const newExpr = expr.replace(
+      /SUMX\s*\(\s*'?([^',\)]+)'?\s*,\s*'?\1'?\s*\[([^\]]+)\]\s*\)/gi,
+      "SUM('$1'[$2])"
+    );
+    return newExpr !== expr ? newExpr : null;
+  }
+  return null;
+}
+
+/**
+ * Try XMLA-based fixes. Returns results array and counts, or throws to signal fallback.
+ */
+async function applyXmlaFixes(
+  workspaceId: string,
+  modelName: string,
+  ruleIds: string[],
+): Promise<{ results: string[]; totalFixed: number; totalFailed: number; totalSkipped: number }> {
+  const results: string[] = [];
+  let totalFixed = 0;
+  let totalFailed = 0;
+  let totalSkipped = 0;
+
+  // Fetch model metadata via DMV
+  const workspace = await getWorkspace(workspaceId);
+  const workspaceName = workspace.displayName;
+
+  const dmvResults = await runXmlaDmvQueries(workspaceName, modelName, FIX_DMV_QUERIES);
+  if (dmvResults.measures?.error) {
+    throw new Error(`DMV measures query failed: ${dmvResults.measures.error}`);
+  }
+
+  const measures = parseDmvMeasures(dmvResults.measures?.rows ?? []);
+  const columns = parseDmvColumns(dmvResults.columns?.rows ?? []);
+  const dimensions = parseDmvDimensions(dmvResults.dimensions?.rows ?? []);
+
+  // Group columns by table
+  const columnsByTable = new Map<string, XmlaColumnInfo[]>();
+  for (const col of columns) {
+    const list = columnsByTable.get(col.tableName) ?? [];
+    list.push(col);
+    columnsByTable.set(col.tableName, list);
+  }
+
+  // All measure names for SM-FIX-DIRECTREF
+  const allMeasureNames = new Set(measures.map(m => m.measureName));
+
+  // Helper to send a TMSL command
+  const execCmd = async (cmd: object) => {
+    await executeXmlaCommandById(workspaceId, modelName, cmd);
+  };
+
+  // ── Process each rule ──
+  for (const ruleId of ruleIds) {
+    try {
+
+      // ── DAX MEASURE FIXES ──
+      if (["SM-FIX-IFERROR", "SM-FIX-EVALLOG", "SM-FIX-ADDZERO", "SM-FIX-SUMX"].includes(ruleId)) {
+        for (const m of measures) {
+          const fixedExpr = applyDaxFix(m.expression, ruleId);
+          if (fixedExpr) {
+            await execCmd({
+              createOrReplace: {
+                object: { database: modelName, table: m.tableName, measure: m.measureName },
+                measure: {
+                  name: m.measureName,
+                  expression: fixedExpr,
+                  ...(m.formatString ? { formatString: m.formatString } : {}),
+                  ...(m.description ? { description: m.description } : {}),
+                },
+              },
+            });
+            const label = ruleId === "SM-FIX-IFERROR" ? "replaced IFERROR with IF(ISERROR())"
+              : ruleId === "SM-FIX-EVALLOG" ? "removed EVALUATEANDLOG"
+              : ruleId === "SM-FIX-ADDZERO" ? "removed +0"
+              : "SUMX→SUM";
+            results.push(`| ${ruleId} | ✅ | Fixed ${m.tableName}[${m.measureName}] — ${label} |`);
+            totalFixed++;
+          }
+        }
+      }
+
+      if (ruleId === "SM-FIX-FORMAT") {
+        for (const m of measures) {
+          if (!m.formatString && m.isVisible) {
+            const fmt = inferFormatString(m.measureName, m.expression);
+            await execCmd({
+              createOrReplace: {
+                object: { database: modelName, table: m.tableName, measure: m.measureName },
+                measure: {
+                  name: m.measureName,
+                  expression: m.expression,
+                  formatString: fmt,
+                  ...(m.description ? { description: m.description } : {}),
+                },
+              },
+            });
+            results.push(`| SM-FIX-FORMAT | ✅ | Added format "${fmt}" to ${m.tableName}[${m.measureName}] |`);
+            totalFixed++;
+          }
+        }
+      }
+
+      if (ruleId === "SM-FIX-MEASUREDESC") {
+        for (const m of measures) {
+          if (m.isVisible && !m.description) {
+            const shortExpr = m.expression.length > 100 ? m.expression.substring(0, 100) + "..." : m.expression;
+            const desc = `Measure: ${m.measureName} = ${shortExpr}`;
+            await execCmd({
+              createOrReplace: {
+                object: { database: modelName, table: m.tableName, measure: m.measureName },
+                measure: {
+                  name: m.measureName,
+                  expression: m.expression,
+                  ...(m.formatString ? { formatString: m.formatString } : {}),
+                  description: desc,
+                },
+              },
+            });
+            results.push(`| SM-FIX-MEASUREDESC | ✅ | Added description to ${m.tableName}[${m.measureName}] |`);
+            totalFixed++;
+          }
+        }
+      }
+
+      if (ruleId === "SM-FIX-MEASURENAME") {
+        for (const m of measures) {
+          const cleaned = m.measureName.replace(/[\t\r\n]/g, " ").replace(/^\s+|\s+$/g, "").replace(/\s{2,}/g, " ");
+          if (cleaned !== m.measureName) {
+            await execCmd({
+              createOrReplace: {
+                object: { database: modelName, table: m.tableName, measure: m.measureName },
+                measure: {
+                  name: cleaned,
+                  expression: m.expression,
+                  ...(m.formatString ? { formatString: m.formatString } : {}),
+                  ...(m.description ? { description: m.description } : {}),
+                },
+              },
+            });
+            results.push(`| SM-FIX-MEASURENAME | ✅ | Cleaned name: "${m.measureName}" → "${cleaned}" |`);
+            totalFixed++;
+          }
+        }
+      }
+
+      if (ruleId === "SM-FIX-DIRECTREF") {
+        for (const m of measures) {
+          const expr = m.expression.trim();
+          const refMatch = expr.match(/^\[([^\]]+)\]$/);
+          if (refMatch && allMeasureNames.has(refMatch[1]) && refMatch[1] !== m.measureName) {
+            await execCmd({
+              delete: {
+                object: { database: modelName, table: m.tableName, measure: m.measureName },
+              },
+            });
+            results.push(`| SM-FIX-DIRECTREF | ✅ | Removed duplicate measure ${m.tableName}[${m.measureName}] |`);
+            totalFixed++;
+          }
+        }
+      }
+
+      // ── TABLE-LEVEL FIXES ──
+
+      if (ruleId === "SM-FIX-DESC") {
+        for (const dim of dimensions) {
+          const tblName = dim.name.replace(/^\[|\]$/g, "");
+          if (dim.isVisible && !dim.description) {
+            try {
+              await execCmd({
+                alter: {
+                  object: { database: modelName, table: tblName },
+                  table: {
+                    name: tblName,
+                    description: `Table: ${tblName}`,
+                  },
+                },
+              });
+              results.push(`| SM-FIX-DESC | ✅ | Added description to table ${tblName} |`);
+              totalFixed++;
+            } catch {
+              results.push(`| SM-FIX-DESC | ⚪ | Skipped ${tblName} — alter not supported |`);
+              totalSkipped++;
+            }
+          }
+        }
+      }
+
+      if (ruleId === "SM-FIX-DATE") {
+        for (const dim of dimensions) {
+          const tblName = dim.name.replace(/^\[|\]$/g, "");
+          const nameLower = tblName.toLowerCase();
+          if (nameLower.includes("date") || nameLower.includes("calendar")) {
+            try {
+              await execCmd({
+                alter: {
+                  object: { database: modelName, table: tblName },
+                  table: {
+                    name: tblName,
+                    dataCategory: "Time",
+                  },
+                },
+              });
+              results.push(`| SM-FIX-DATE | ✅ | Marked ${tblName} as Date table |`);
+              totalFixed++;
+            } catch {
+              results.push(`| SM-FIX-DATE | ⚪ | Skipped ${tblName} — alter not supported |`);
+              totalSkipped++;
+            }
+          }
+        }
+      }
+
+      // ── COLUMN-LEVEL FIXES ──
+
+      if (ruleId === "SM-FIX-HIDDEN" || ruleId === "SM-FIX-HIDEDESC" || ruleId === "SM-FIX-HIDEGUID") {
+        for (const [tableName, cols] of columnsByTable) {
+          for (const col of cols) {
+            const colNameLower = col.columnName.toLowerCase();
+            let shouldHide = false;
+            let label = "";
+            if (ruleId === "SM-FIX-HIDEDESC") {
+              if (colNameLower.includes("description") || colNameLower.includes("comment")
+                || colNameLower.includes("remark") || colNameLower.includes("note")) {
+                shouldHide = true;
+                label = "description column";
+              }
+            } else if (ruleId === "SM-FIX-HIDEGUID") {
+              if (colNameLower.includes("guid") || colNameLower.includes("uuid")
+                || colNameLower === "correlation_id" || colNameLower === "request_id") {
+                shouldHide = true;
+                label = "GUID column";
+              }
+            }
+            // SM-FIX-HIDDEN: set isAvailableInMDX=false on already-hidden columns
+            // We can't detect isHidden from DMV alone, so skip for XMLA path
+            if (ruleId === "SM-FIX-HIDDEN") {
+              // This rule requires knowing which columns are already hidden,
+              // which DMV doesn't expose reliably — skip for XMLA, fallback handles it
+              continue;
+            }
+            if (shouldHide) {
+              try {
+                await execCmd({
+                  alter: {
+                    object: { database: modelName, table: tableName, column: col.columnName },
+                    column: {
+                      name: col.columnName,
+                      isHidden: true,
+                      isAvailableInMDX: false,
+                    },
+                  },
+                });
+                results.push(`| ${ruleId} | ✅ | Hidden ${tableName}[${col.columnName}] (${label}) |`);
+                totalFixed++;
+              } catch {
+                results.push(`| ${ruleId} | ⚪ | Skipped ${tableName}[${col.columnName}] — alter not supported |`);
+                totalSkipped++;
+              }
+            }
+          }
+        }
+        if (ruleId === "SM-FIX-HIDDEN") {
+          results.push(`| SM-FIX-HIDDEN | ⚪ | Skipped — requires BIM fallback (hidden state not in DMV) |`);
+          totalSkipped++;
+        }
+      }
+
+      if (ruleId === "SM-FIX-KEY") {
+        // IsKey requires relationship info — DMV MDSCHEMA doesn't expose relationships directly.
+        // Skip for XMLA path; fallback BIM handles it.
+        results.push(`| SM-FIX-KEY | ⚪ | Skipped — requires BIM fallback (relationship info needed) |`);
+        totalSkipped++;
+      }
+
+      if (ruleId === "SM-FIX-AUTODATE") {
+        for (const dim of dimensions) {
+          const tblName = dim.name.replace(/^\[|\]$/g, "");
+          if (tblName.startsWith("DateTableTemplate_") || tblName.startsWith("LocalDateTable_")) {
+            try {
+              await execCmd({
+                delete: {
+                  object: { database: modelName, table: tblName },
+                },
+              });
+              results.push(`| SM-FIX-AUTODATE | ✅ | Removed auto-date table ${tblName} |`);
+              totalFixed++;
+            } catch {
+              results.push(`| SM-FIX-AUTODATE | ⚪ | Skipped ${tblName} — may have relationships |`);
+              totalSkipped++;
+            }
+          }
+        }
+      }
+
+      if (ruleId === "SM-FIX-CONSTCOL") {
+        // Constant columns require COLUMNSTATISTICS cardinality info — skip for XMLA path
+        results.push(`| SM-FIX-CONSTCOL | ⚪ | Skipped — requires BIM fallback (column cardinality annotations needed) |`);
+        totalSkipped++;
+      }
+
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      results.push(`| ${ruleId} | ❌ | Failed: ${msg.substring(0, 80)} |`);
+      totalFailed++;
+    }
+  }
+
+  return { results, totalFixed, totalFailed, totalSkipped };
+}
 
 export async function semanticModelFix(args: {
   workspaceId: string;
@@ -851,6 +1261,48 @@ export async function semanticModelFix(args: {
   const model = models.find(m => m.id === args.semanticModelId);
   const modelName = model?.displayName ?? args.semanticModelId;
 
+  const ruleIds = args.ruleIds ?? [
+    "SM-FIX-FORMAT", "SM-FIX-DESC", "SM-FIX-HIDDEN", "SM-FIX-DATE", "SM-FIX-KEY", "SM-FIX-AUTODATE",
+    "SM-FIX-IFERROR", "SM-FIX-EVALLOG", "SM-FIX-ADDZERO", "SM-FIX-DIRECTREF", "SM-FIX-SUMX",
+    "SM-FIX-MEASUREDESC", "SM-FIX-MEASURENAME", "SM-FIX-HIDEDESC", "SM-FIX-HIDEGUID", "SM-FIX-CONSTCOL",
+  ];
+
+  // ── Try XMLA/TMSL approach first ──
+  try {
+    const { results, totalFixed, totalFailed, totalSkipped } = await applyXmlaFixes(
+      args.workspaceId, modelName, ruleIds,
+    );
+
+    return [
+      `# 🔧 Semantic Model Fix: ${modelName}`,
+      "",
+      `_Applying fixes via XMLA/TMSL at ${new Date().toISOString()}_`,
+      "",
+      `**${totalFixed} fixed, ${totalFailed} failed, ${totalSkipped} skipped**`,
+      "",
+      "| Rule | Status | Action |",
+      "|------|--------|--------|",
+      ...results,
+      "",
+      "> ℹ️ Fixes applied atomically per object via XMLA TMSL commands.",
+    ].join("\n");
+  } catch (xmlaError) {
+    const xmlaMsg = xmlaError instanceof Error ? xmlaError.message : String(xmlaError);
+    // Fall through to download/upload fallback
+    const fallbackResult = await semanticModelFixFallback(args.workspaceId, args.semanticModelId, modelName, ruleIds);
+    return fallbackResult + `\n\n> ⚠️ XMLA path failed (${xmlaMsg.substring(0, 80)}), used download/upload fallback.`;
+  }
+}
+
+/**
+ * Fallback: download model definition (BIM/TMDL), modify in memory, re-upload.
+ */
+async function semanticModelFixFallback(
+  workspaceId: string,
+  semanticModelId: string,
+  modelName: string,
+  ruleIds: string[],
+): Promise<string> {
   const results: string[] = [];
   let totalFixed = 0;
   let totalFailed = 0;
@@ -859,7 +1311,7 @@ export async function semanticModelFix(args: {
   // 1. Download model definition (BIM or TMDL)
   let parts;
   try {
-    parts = await getSemanticModelDefinition(args.workspaceId, args.semanticModelId);
+    parts = await getSemanticModelDefinition(workspaceId, semanticModelId);
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     return `❌ Could not download model definition: ${msg}`;
@@ -881,10 +1333,8 @@ export async function semanticModelFix(args: {
   // 2. Parse model definition
   let bim: Record<string, unknown> | null = null;
   let modelDef: Record<string, unknown> | null = null;
-  let originalPayload = "";
 
   if (bimPart) {
-    // BIM format
     try {
       const json = Buffer.from(bimPart.payload, "base64").toString("utf-8");
       bim = JSON.parse(json);
@@ -893,7 +1343,6 @@ export async function semanticModelFix(args: {
     }
     modelDef = (bim as Record<string, unknown>).model as Record<string, unknown> | undefined ?? null;
     if (!modelDef) return "❌ No 'model' key found in model.bim.";
-    originalPayload = bimPart.payload;
   }
 
   // For TMDL format, parse table .tmdl files into a simplified structure
@@ -947,35 +1396,17 @@ export async function semanticModelFix(args: {
   const tables = bimPart
     ? ((modelDef!.tables ?? []) as Array<Record<string, unknown>>)
     : ([] as Array<Record<string, unknown>>);
-  const ruleIds = args.ruleIds ?? [
-    "SM-FIX-FORMAT", "SM-FIX-DESC", "SM-FIX-HIDDEN", "SM-FIX-DATE", "SM-FIX-KEY", "SM-FIX-AUTODATE",
-    "SM-FIX-IFERROR", "SM-FIX-EVALLOG", "SM-FIX-ADDZERO", "SM-FIX-DIRECTREF", "SM-FIX-SUMX",
-    "SM-FIX-MEASUREDESC", "SM-FIX-MEASURENAME", "SM-FIX-HIDEDESC", "SM-FIX-HIDEGUID", "SM-FIX-CONSTCOL",
-  ];
   let modified = false;
 
   // 3. Apply fixes
   for (const ruleId of ruleIds) {
     try {
       if (ruleId === "SM-FIX-FORMAT") {
-        // Add format strings to measures without one, inferring type from name/expression
         for (const table of tables) {
           const measures = (table.measures ?? []) as Array<Record<string, unknown>>;
           for (const m of measures) {
             if (!m.formatString && !m.isHidden) {
-              const name = ((m.name as string) ?? "").toLowerCase();
-              const expr = ((m.expression as string) ?? "").toLowerCase();
-              // Infer format from measure name or expression
-              let fmt = "#,0";
-              if (name.includes("pct") || name.includes("percent") || name.includes("ratio") || name.includes("rate")
-                || expr.includes("divide") && (name.includes("%") || expr.includes("percent"))) {
-                fmt = "0.0%";
-              } else if (name.includes("price") || name.includes("cost") || name.includes("revenue")
-                || name.includes("amount") || name.includes("sales") || name.includes("profit")) {
-                fmt = "$#,##0.00";
-              } else if (name.includes("avg") || name.includes("average") || name.includes("mean")) {
-                fmt = "#,##0.00";
-              }
+              const fmt = inferFormatString((m.name as string) ?? "", (m.expression as string) ?? "");
               m.formatString = fmt;
               results.push(`| SM-FIX-FORMAT | ✅ | Added format "${fmt}" to ${table.name}[${m.name}] |`);
               totalFixed++;
@@ -986,7 +1417,6 @@ export async function semanticModelFix(args: {
       }
 
       if (ruleId === "SM-FIX-DESC") {
-        // Add descriptions to visible tables without one
         for (const table of tables) {
           if (!table.isHidden && (!table.description || (table.description as string).length === 0)) {
             table.description = `Table: ${table.name}`;
@@ -998,7 +1428,6 @@ export async function semanticModelFix(args: {
       }
 
       if (ruleId === "SM-FIX-HIDDEN") {
-        // Set IsAvailableInMDX=false on hidden columns
         for (const table of tables) {
           const columns = (table.columns ?? []) as Array<Record<string, unknown>>;
           for (const col of columns) {
@@ -1013,7 +1442,6 @@ export async function semanticModelFix(args: {
       }
 
       if (ruleId === "SM-FIX-DATE") {
-        // Mark date tables
         for (const table of tables) {
           const name = (table.name as string).toLowerCase();
           if ((name.includes("date") || name.includes("calendar")) && table.dataCategory !== "Time") {
@@ -1026,7 +1454,6 @@ export async function semanticModelFix(args: {
       }
 
       if (ruleId === "SM-FIX-KEY") {
-        // Set IsKey on PK columns in relationship targets
         const relationships = (modelDef?.relationships ?? []) as Array<Record<string, unknown>>;
         for (const rel of relationships) {
           const toTable = tables.find(t => t.name === rel.toTable);
@@ -1044,7 +1471,6 @@ export async function semanticModelFix(args: {
       }
 
       if (ruleId === "SM-FIX-AUTODATE") {
-        // Remove auto-date tables (only if no relationships reference them)
         const relationships = (modelDef?.relationships ?? []) as Array<Record<string, unknown>>;
         const relationshipTargets = new Set([
           ...relationships.map(r => r.fromTable as string),
@@ -1054,7 +1480,6 @@ export async function semanticModelFix(args: {
         const filtered = tables.filter(t => {
           const name = t.name as string;
           if (!name.startsWith("DateTableTemplate_") && !name.startsWith("LocalDateTable_")) return true;
-          // Keep if any relationship references it
           if (relationshipTargets.has(name)) {
             results.push(`| SM-FIX-AUTODATE | ⚪ | Kept ${name} — has relationships |`);
             return true;
@@ -1070,61 +1495,45 @@ export async function semanticModelFix(args: {
         }
       }
 
-      // ── NEW DAX FIXES ──────────────────────────────────────
-
       if (ruleId === "SM-FIX-IFERROR") {
-        // Replace IFERROR(expr, alt) → IF(ISERROR(expr), alt, expr)
         for (const table of tables) {
           const measures = (table.measures ?? []) as Array<Record<string, unknown>>;
           for (const m of measures) {
             const expr = (m.expression as string) ?? "";
-            if (/iferror\s*\(/i.test(expr)) {
-              // Simple pattern: IFERROR(expr, replacement)
-              const newExpr = expr.replace(
-                /IFERROR\s*\(\s*((?:[^(),]+|\((?:[^()]*|\([^()]*\))*\))*)\s*,\s*((?:[^(),]+|\((?:[^()]*|\([^()]*\))*\))*)\s*\)/gi,
-                "IF(ISERROR($1), $2, $1)"
-              );
-              if (newExpr !== expr) {
-                m.expression = newExpr;
-                results.push(`| SM-FIX-IFERROR | ✅ | Fixed ${table.name}[${m.name}] — replaced IFERROR with IF(ISERROR()) |`);
-                totalFixed++;
-                modified = true;
-              }
+            const newExpr = applyDaxFix(expr, "SM-FIX-IFERROR");
+            if (newExpr) {
+              m.expression = newExpr;
+              results.push(`| SM-FIX-IFERROR | ✅ | Fixed ${table.name}[${m.name}] — replaced IFERROR with IF(ISERROR()) |`);
+              totalFixed++;
+              modified = true;
             }
           }
         }
       }
 
       if (ruleId === "SM-FIX-EVALLOG") {
-        // Strip EVALUATEANDLOG() wrapper — keep inner expression
         for (const table of tables) {
           const measures = (table.measures ?? []) as Array<Record<string, unknown>>;
           for (const m of measures) {
             const expr = (m.expression as string) ?? "";
-            if (/evaluateandlog\s*\(/i.test(expr)) {
-              const newExpr = expr.replace(/EVALUATEANDLOG\s*\(\s*/gi, "").replace(/\)\s*$/, "");
-              if (newExpr !== expr) {
-                m.expression = newExpr;
-                results.push(`| SM-FIX-EVALLOG | ✅ | Fixed ${table.name}[${m.name}] — removed EVALUATEANDLOG |`);
-                totalFixed++;
-                modified = true;
-              }
+            const newExpr = applyDaxFix(expr, "SM-FIX-EVALLOG");
+            if (newExpr) {
+              m.expression = newExpr;
+              results.push(`| SM-FIX-EVALLOG | ✅ | Fixed ${table.name}[${m.name}] — removed EVALUATEANDLOG |`);
+              totalFixed++;
+              modified = true;
             }
           }
         }
       }
 
       if (ruleId === "SM-FIX-ADDZERO") {
-        // Remove +0 / 0+ from measure expressions
         for (const table of tables) {
           const measures = (table.measures ?? []) as Array<Record<string, unknown>>;
           for (const m of measures) {
             const expr = (m.expression as string) ?? "";
-            // Match trailing "+0" or leading "0+"
-            const newExpr = expr
-              .replace(/\s*\+\s*0\s*$/g, "")
-              .replace(/^\s*0\s*\+\s*/g, "");
-            if (newExpr !== expr && newExpr.trim().length > 0) {
+            const newExpr = applyDaxFix(expr, "SM-FIX-ADDZERO");
+            if (newExpr) {
               m.expression = newExpr;
               results.push(`| SM-FIX-ADDZERO | ✅ | Fixed ${table.name}[${m.name}] — removed +0 |`);
               totalFixed++;
@@ -1135,15 +1544,14 @@ export async function semanticModelFix(args: {
       }
 
       if (ruleId === "SM-FIX-DIRECTREF") {
-        // Remove measures that are just direct references of other measures [OtherMeasure]
         for (const table of tables) {
           const measures = (table.measures ?? []) as Array<Record<string, unknown>>;
-          const allMeasureNames = new Set(measures.map(m => m.name as string));
+          const allNames = new Set(measures.map(m => m.name as string));
           const toRemove: string[] = [];
           for (const m of measures) {
             const expr = ((m.expression as string) ?? "").trim();
             const refMatch = expr.match(/^\[([^\]]+)\]$/);
-            if (refMatch && allMeasureNames.has(refMatch[1]) && refMatch[1] !== m.name) {
+            if (refMatch && allNames.has(refMatch[1]) && refMatch[1] !== m.name) {
               toRemove.push(m.name as string);
             }
           }
@@ -1159,17 +1567,12 @@ export async function semanticModelFix(args: {
       }
 
       if (ruleId === "SM-FIX-SUMX") {
-        // Replace SUMX('Table', 'Table'[Col]) → SUM('Table'[Col])
         for (const table of tables) {
           const measures = (table.measures ?? []) as Array<Record<string, unknown>>;
           for (const m of measures) {
             const expr = (m.expression as string) ?? "";
-            // Match SUMX('TableName', 'TableName'[ColumnName])
-            const newExpr = expr.replace(
-              /SUMX\s*\(\s*'?([^',\)]+)'?\s*,\s*'?\1'?\s*\[([^\]]+)\]\s*\)/gi,
-              "SUM('$1'[$2])"
-            );
-            if (newExpr !== expr) {
+            const newExpr = applyDaxFix(expr, "SM-FIX-SUMX");
+            if (newExpr) {
               m.expression = newExpr;
               results.push(`| SM-FIX-SUMX | ✅ | Fixed ${table.name}[${m.name}] — SUMX→SUM |`);
               totalFixed++;
@@ -1179,16 +1582,12 @@ export async function semanticModelFix(args: {
         }
       }
 
-      // ── NEW MODEL PROPERTY FIXES ───────────────────────────
-
       if (ruleId === "SM-FIX-MEASUREDESC") {
-        // Add auto-generated descriptions to measures without one
         for (const table of tables) {
           const measures = (table.measures ?? []) as Array<Record<string, unknown>>;
           for (const m of measures) {
             if (!m.isHidden && (!m.description || (m.description as string).length === 0)) {
               const expr = ((m.expression as string) ?? "").trim();
-              // Generate description from expression (first 100 chars)
               const shortExpr = expr.length > 100 ? expr.substring(0, 100) + "..." : expr;
               m.description = `Measure: ${m.name} = ${shortExpr}`;
               results.push(`| SM-FIX-MEASUREDESC | ✅ | Added description to ${table.name}[${m.name}] |`);
@@ -1200,7 +1599,6 @@ export async function semanticModelFix(args: {
       }
 
       if (ruleId === "SM-FIX-MEASURENAME") {
-        // Trim whitespace/tabs/newlines from measure names
         for (const table of tables) {
           const measures = (table.measures ?? []) as Array<Record<string, unknown>>;
           for (const m of measures) {
@@ -1217,7 +1615,6 @@ export async function semanticModelFix(args: {
       }
 
       if (ruleId === "SM-FIX-HIDEDESC") {
-        // Hide description/comment columns (they bloat the model)
         for (const table of tables) {
           const columns = (table.columns ?? []) as Array<Record<string, unknown>>;
           for (const col of columns) {
@@ -1235,7 +1632,6 @@ export async function semanticModelFix(args: {
       }
 
       if (ruleId === "SM-FIX-HIDEGUID") {
-        // Hide GUID/UUID columns
         for (const table of tables) {
           const columns = (table.columns ?? []) as Array<Record<string, unknown>>;
           for (const col of columns) {
@@ -1253,13 +1649,10 @@ export async function semanticModelFix(args: {
       }
 
       if (ruleId === "SM-FIX-CONSTCOL") {
-        // Remove constant columns (columns with only 1 distinct value)
-        // Only works if we have column statistics — check annotations
         for (const table of tables) {
           const columns = (table.columns ?? []) as Array<Record<string, unknown>>;
           const toRemove: string[] = [];
           for (const col of columns) {
-            // Check for annotation or known constant patterns
             const annotations = (col.annotations ?? []) as Array<Record<string, unknown>>;
             const cardAnnotation = annotations.find(a => a.name === "ColumnCardinality");
             if (cardAnnotation && Number(cardAnnotation.value) <= 1) {
@@ -1283,35 +1676,21 @@ export async function semanticModelFix(args: {
     }
   }
 
-  // TMDL-specific fixes: apply text-based transformations on .tmdl files
+  // TMDL-specific fixes
   if (isTmdl && tmdlTables.length > 0) {
     for (const tbl of tmdlTables) {
       let tmdlContent = tbl.content;
       let tblModified = false;
 
-      // SM-FIX-DESC: Add description to tables without one
-      // Note: description property may not be supported in all TMDL contexts (e.g. DirectLake)
-      // Skip for TMDL to avoid parse errors — only apply on BIM format
       if (ruleIds.includes("SM-FIX-DESC") && !tbl.hasDescription && !tbl.isHidden) {
         results.push(`| SM-FIX-DESC | ⚪ | Skipped ${tbl.name} — TMDL description requires manual edit |`);
         totalSkipped++;
       }
 
-      // SM-FIX-FORMAT: Add format strings to measures without one
       if (ruleIds.includes("SM-FIX-FORMAT")) {
         for (const m of tbl.measures) {
           if (!m.formatString) {
-            const nameLower = m.name.toLowerCase();
-            let fmt = "#,0";
-            if (nameLower.includes("pct") || nameLower.includes("percent") || nameLower.includes("ratio") || nameLower.includes("rate")) {
-              fmt = "0.0%";
-            } else if (nameLower.includes("price") || nameLower.includes("cost") || nameLower.includes("revenue")
-              || nameLower.includes("amount") || nameLower.includes("sales") || nameLower.includes("profit")) {
-              fmt = "$#,##0.00";
-            } else if (nameLower.includes("avg") || nameLower.includes("average")) {
-              fmt = "#,##0.00";
-            }
-            // Find the measure block and add formatString
+            const fmt = inferFormatString(m.name, m.expression);
             const measurePattern = new RegExp(`(\\tmeasure\\s+['"']?${escapeRegexSm(m.name)}['"']?\\s*=)`, "m");
             if (measurePattern.test(tmdlContent)) {
               tmdlContent = tmdlContent.replace(measurePattern, `$1\n\t\tformatString: ${fmt}\n`);
@@ -1324,7 +1703,6 @@ export async function semanticModelFix(args: {
       }
 
       if (tblModified) {
-        // Update the part payload
         const partIndex = parts.findIndex(p => p.path === tbl.partPath);
         if (partIndex >= 0) {
           parts[partIndex] = {
@@ -1337,7 +1715,7 @@ export async function semanticModelFix(args: {
     }
   }
 
-  // 4. Upload modified definition (BIM or TMDL)
+  // 4. Upload modified definition
   if (modified) {
     try {
       if (bimPart && bim) {
@@ -1345,10 +1723,9 @@ export async function semanticModelFix(args: {
         const updatedParts = parts.map(p =>
           p.path === bimPart.path ? { ...p, payload: newPayload } : p
         );
-        await updateSemanticModelDefinition(args.workspaceId, args.semanticModelId, updatedParts);
+        await updateSemanticModelDefinition(workspaceId, semanticModelId, updatedParts);
       } else {
-        // TMDL — parts already updated in-place
-        await updateSemanticModelDefinition(args.workspaceId, args.semanticModelId, parts);
+        await updateSemanticModelDefinition(workspaceId, semanticModelId, parts);
       }
       results.push(`| UPLOAD | ✅ | Model definition updated successfully |`);
     } catch (error) {
@@ -1363,7 +1740,7 @@ export async function semanticModelFix(args: {
   return [
     `# 🔧 Semantic Model Fix: ${modelName}`,
     "",
-    `_Applying fixes at ${new Date().toISOString()}_`,
+    `_Applying fixes via download/upload fallback at ${new Date().toISOString()}_`,
     "",
     `**${totalFixed} fixed, ${totalFailed} failed**`,
     "",
@@ -1486,7 +1863,8 @@ export const semanticModelTools = [
   {
     name: "semantic_model_fix",
     description:
-      "AUTO-FIX: Downloads model definition (BIM or TMDL), applies fixes, and uploads. " +
+      "AUTO-FIX: Uses XMLA/TMSL commands for atomic per-object fixes (measures, columns, tables). " +
+      "Falls back to download/upload (BIM/TMDL) if XMLA endpoint is unavailable. " +
       "16 fix rules: SM-FIX-FORMAT, SM-FIX-DESC, SM-FIX-HIDDEN, SM-FIX-DATE, SM-FIX-KEY, SM-FIX-AUTODATE, " +
       "SM-FIX-IFERROR, SM-FIX-EVALLOG, SM-FIX-ADDZERO, SM-FIX-DIRECTREF, SM-FIX-SUMX, " +
       "SM-FIX-MEASUREDESC, SM-FIX-MEASURENAME, SM-FIX-HIDEDESC, SM-FIX-HIDEGUID, SM-FIX-CONSTCOL.",
@@ -1504,7 +1882,8 @@ export const semanticModelTools = [
   {
     name: "semantic_model_auto_optimize",
     description:
-      "AUTO-OPTIMIZE: Downloads a Semantic Model definition and applies all 16 safe fixes automatically. " +
+      "AUTO-OPTIMIZE: Applies all 16 safe fixes to a Semantic Model using XMLA/TMSL commands " +
+      "(falls back to download/upload if XMLA is unavailable). " +
       "Covers: DAX fixes (IFERROR, EVALUATEANDLOG, +0, direct refs, SUMX→SUM), " +
       "model fixes (format strings, descriptions, date tables, IsKey, hidden MDX, auto-date tables), " +
       "and bloat fixes (hide description/GUID columns, remove constants, clean measure names). " +

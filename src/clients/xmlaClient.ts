@@ -1,10 +1,11 @@
 import { getAccessToken } from "../auth/fabricAuth.js";
 import { getTokenForScope } from "../auth/fabricAuth.js";
 import { XMLParser } from "fast-xml-parser";
+import { getWorkspace } from "./fabricClient.js";
 
 // ──────────────────────────────────────────────
 // XMLA Client — connects to Fabric/Power BI
-// Analysis Services XMLA endpoint for DMV queries
+// Analysis Services XMLA endpoint for DMV/TMSL
 // ──────────────────────────────────────────────
 
 const ANALYSIS_SCOPE = "https://analysis.windows.net/powerbi/api/.default";
@@ -111,6 +112,91 @@ function escapeXml(str: string): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&apos;");
+}
+
+/**
+ * Execute a TMSL command (createOrReplace, alter, delete, etc.) via XMLA SOAP.
+ * TMSL JSON is sent inside a <Statement> element, same as DMV queries.
+ */
+export async function executeXmlaCommand(
+  workspaceName: string,
+  datasetName: string,
+  tmslCommand: object
+): Promise<void> {
+  const token = await getTokenForScope(ANALYSIS_SCOPE);
+  const xmlaUrl = getXmlaUrl(workspaceName);
+  const commandJson = JSON.stringify(tmslCommand);
+
+  const soapEnvelope = `<?xml version="1.0" encoding="UTF-8"?>
+<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/">
+  <Body>
+    <Execute xmlns="urn:schemas-microsoft-com:xml-analysis">
+      <Command>
+        <Statement>${escapeXml(commandJson)}</Statement>
+      </Command>
+      <Properties>
+        <PropertyList>
+          <Catalog>${escapeXml(datasetName)}</Catalog>
+        </PropertyList>
+      </Properties>
+    </Execute>
+  </Body>
+</Envelope>`;
+
+  const response = await fetch(xmlaUrl, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/xml",
+    },
+    body: soapEnvelope,
+  });
+
+  if (!response.ok) {
+    const errorText = (await response.text()).substring(0, 500);
+    throw new Error(`XMLA command failed (${response.status}): ${errorText}`);
+  }
+
+  const xml = await response.text();
+  // Parse to check for SOAP faults / AS errors
+  parseXmlaCommandResponse(xml);
+}
+
+/**
+ * Execute a TMSL command by workspace ID (resolves display name automatically).
+ */
+export async function executeXmlaCommandById(
+  workspaceId: string,
+  datasetName: string,
+  tmslCommand: object
+): Promise<void> {
+  const workspace = await getWorkspace(workspaceId);
+  return executeXmlaCommand(workspace.displayName, datasetName, tmslCommand);
+}
+
+/**
+ * Parse XMLA SOAP response for commands — checks for faults/errors, does not return rows.
+ */
+function parseXmlaCommandResponse(xml: string): void {
+  const parsed = xmlParser.parse(xml);
+  const envelope = parsed?.Envelope ?? parsed?.["soap:Envelope"] ?? parsed;
+  const body = envelope?.Body ?? envelope?.["soap:Body"] ?? envelope;
+
+  const fault = body?.Fault ?? body?.["soap:Fault"];
+  if (fault) {
+    const faultString = fault?.faultstring ?? fault?.detail?.Error?.["@_Description"] ?? "Unknown SOAP fault";
+    throw new Error(`XMLA SOAP Fault: ${faultString}`);
+  }
+
+  const execResponse = body?.ExecuteResponse ?? body;
+  const returnVal = execResponse?.return ?? execResponse;
+  const root = returnVal?.root ?? returnVal;
+
+  const error = root?.Exception ?? root?.Messages?.Error;
+  if (error) {
+    const desc = Array.isArray(error) ? error[0]?.["@_Description"] : error?.["@_Description"];
+    throw new Error(`XMLA Error: ${desc ?? "Unknown error"}`);
+  }
 }
 
 /**
