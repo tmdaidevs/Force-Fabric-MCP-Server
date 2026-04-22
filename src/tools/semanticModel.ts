@@ -854,6 +854,7 @@ export async function semanticModelFix(args: {
   const results: string[] = [];
   let totalFixed = 0;
   let totalFailed = 0;
+  let totalSkipped = 0;
 
   // 1. Download model definition (BIM or TMDL)
   let parts;
@@ -1078,18 +1079,11 @@ export async function semanticModelFix(args: {
       let tblModified = false;
 
       // SM-FIX-DESC: Add description to tables without one
+      // Note: description property may not be supported in all TMDL contexts (e.g. DirectLake)
+      // Skip for TMDL to avoid parse errors — only apply on BIM format
       if (ruleIds.includes("SM-FIX-DESC") && !tbl.hasDescription && !tbl.isHidden) {
-        // Insert description after the table declaration line, before lineageTag
-        // TMDL uses 2-tab (8 space) indentation for table-level properties
-        const descLine = `\t\tdescription: Table: ${tbl.name}`;
-        // Insert after "table <name>" line
-        tmdlContent = tmdlContent.replace(
-          /^(table\s+.+\n)/m,
-          `$1${descLine}\n`
-        );
-        results.push(`| SM-FIX-DESC | ✅ | Added description to table ${tbl.name} |`);
-        totalFixed++;
-        tblModified = true;
+        results.push(`| SM-FIX-DESC | ⚪ | Skipped ${tbl.name} — TMDL description requires manual edit |`);
+        totalSkipped++;
       }
 
       // SM-FIX-FORMAT: Add format strings to measures without one
