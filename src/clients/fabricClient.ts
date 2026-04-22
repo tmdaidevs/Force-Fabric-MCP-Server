@@ -312,37 +312,123 @@ export async function getSemanticModelDefinition(
   workspaceId: string,
   semanticModelId: string
 ): Promise<SemanticModelDefinitionPart[]> {
-  // This is a long-running operation
-  const result = await fabricFetch<{ definition?: { parts: SemanticModelDefinitionPart[] } }>(
-    `/workspaces/${encodeURIComponent(workspaceId)}/semanticModels/${encodeURIComponent(semanticModelId)}/getDefinition`,
-    { method: "POST" }
-  );
+  const token = await getAccessToken();
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+  };
 
-  if (result.definition?.parts) {
-    return result.definition.parts;
+  // Initial request — may return 200 (inline) or 202 (long-running)
+  const url = `${FABRIC_API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/semanticModels/${encodeURIComponent(semanticModelId)}/getDefinition`;
+  const response = await fetch(url, { method: "POST", headers });
+
+  if (response.status === 200) {
+    const data = await response.json() as { definition?: { parts: SemanticModelDefinitionPart[] } };
+    return data.definition?.parts ?? [];
   }
 
-  // If 202, we need to poll — but for now return empty
-  return [];
+  if (response.status === 202) {
+    const location = response.headers.get("Location");
+    const retryAfter = parseInt(response.headers.get("Retry-After") ?? "10", 10);
+    if (!location) return [];
+
+    // Poll operation until complete
+    const maxPollTime = 120_000;
+    const start = Date.now();
+    let pollInterval = retryAfter * 1000;
+
+    while (Date.now() - start < maxPollTime) {
+      await new Promise(r => setTimeout(r, pollInterval));
+      pollInterval = Math.min(pollInterval * 1.5, 15_000);
+
+      const freshToken = await getAccessToken();
+      const pollResp = await fetch(location, {
+        headers: { Authorization: `Bearer ${freshToken}` },
+      });
+
+      if (!pollResp.ok) continue;
+      const opStatus = await pollResp.json() as { status: string; percentComplete?: number };
+
+      if (opStatus.status === "Succeeded") {
+        // Fetch the result
+        const resultResp = await fetch(`${location}/result`, {
+          headers: { Authorization: `Bearer ${freshToken}` },
+        });
+        if (resultResp.ok) {
+          const resultData = await resultResp.json() as { definition?: { parts: SemanticModelDefinitionPart[] } };
+          return resultData.definition?.parts ?? [];
+        }
+        return [];
+      }
+
+      if (opStatus.status === "Failed") {
+        throw new Error("getDefinition operation failed.");
+      }
+    }
+    throw new Error("getDefinition operation timed out.");
+  }
+
+  const errorText = await response.text();
+  throw new Error(`Fabric API error (${response.status}): ${errorText}`);
 }
 
 /**
- * Update the definition (model.bim) of a Semantic Model.
+ * Update the definition (model.bim / TMDL) of a Semantic Model.
+ * Handles 202 long-running operations with polling.
  */
 export async function updateSemanticModelDefinition(
   workspaceId: string,
   semanticModelId: string,
   parts: SemanticModelDefinitionPart[]
 ): Promise<void> {
-  await fabricFetch(
-    `/workspaces/${encodeURIComponent(workspaceId)}/semanticModels/${encodeURIComponent(semanticModelId)}/updateDefinition`,
-    {
-      method: "POST",
-      body: {
-        definition: { parts },
-      },
+  const token = await getAccessToken();
+  const url = `${FABRIC_API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/semanticModels/${encodeURIComponent(semanticModelId)}/updateDefinition`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ definition: { parts } }),
+  });
+
+  if (response.status === 200 || response.status === 204) return;
+
+  if (response.status === 202) {
+    const location = response.headers.get("Location");
+    const retryAfter = parseInt(response.headers.get("Retry-After") ?? "10", 10);
+    if (!location) return;
+
+    // Poll until complete
+    const maxPollTime = 120_000;
+    const start = Date.now();
+    let pollInterval = retryAfter * 1000;
+
+    while (Date.now() - start < maxPollTime) {
+      await new Promise(r => setTimeout(r, pollInterval));
+      pollInterval = Math.min(pollInterval * 1.5, 15_000);
+
+      const freshToken = await getAccessToken();
+      const pollResp = await fetch(location, {
+        headers: { Authorization: `Bearer ${freshToken}` },
+      });
+
+      if (!pollResp.ok) continue;
+      const opStatus = await pollResp.json() as { status: string };
+
+      if (opStatus.status === "Succeeded") return;
+      if (opStatus.status === "Failed") {
+        throw new Error("updateDefinition operation failed.");
+      }
     }
-  );
+    throw new Error("updateDefinition operation timed out.");
+  }
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Fabric API error (${response.status}): ${errorText}`);
+  }
 }
 
 // ──────────────────────────────────────────────

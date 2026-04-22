@@ -855,7 +855,7 @@ export async function semanticModelFix(args: {
   let totalFixed = 0;
   let totalFailed = 0;
 
-  // 1. Download model.bim
+  // 1. Download model definition (BIM or TMDL)
   let parts;
   try {
     parts = await getSemanticModelDefinition(args.workspaceId, args.semanticModelId);
@@ -864,27 +864,88 @@ export async function semanticModelFix(args: {
     return `❌ Could not download model definition: ${msg}`;
   }
 
+  if (parts.length === 0) {
+    return "❌ No definition parts returned. The model may not be accessible.";
+  }
+
+  // Detect format: BIM (single model.bim JSON) or TMDL (multiple .tmdl files)
   const bimPart = parts.find(p => p.path === "model.bim" || p.path.endsWith(".bim"));
-  if (!bimPart) {
-    return "❌ No model.bim found in definition. Model format may not be supported (try TMDL format).";
+  const tmdlParts = parts.filter(p => p.path.endsWith(".tmdl"));
+  const isTmdl = !bimPart && tmdlParts.length > 0;
+
+  if (!bimPart && !isTmdl) {
+    return "❌ No model.bim or .tmdl files found in definition. Format not supported.";
   }
 
-  // 2. Parse model.bim JSON
-  let bim: Record<string, unknown>;
-  try {
-    const json = Buffer.from(bimPart.payload, "base64").toString("utf-8");
-    bim = JSON.parse(json);
-  } catch {
-    return "❌ Could not parse model.bim JSON.";
+  // 2. Parse model definition
+  let bim: Record<string, unknown> | null = null;
+  let modelDef: Record<string, unknown> | null = null;
+  let originalPayload = "";
+
+  if (bimPart) {
+    // BIM format
+    try {
+      const json = Buffer.from(bimPart.payload, "base64").toString("utf-8");
+      bim = JSON.parse(json);
+    } catch {
+      return "❌ Could not parse model.bim JSON.";
+    }
+    modelDef = (bim as Record<string, unknown>).model as Record<string, unknown> | undefined ?? null;
+    if (!modelDef) return "❌ No 'model' key found in model.bim.";
+    originalPayload = bimPart.payload;
   }
 
-  const modelDef = (bim as Record<string, unknown>).model as Record<string, unknown> | undefined;
-  if (!modelDef) return "❌ No 'model' key found in model.bim.";
+  // For TMDL format, parse table .tmdl files into a simplified structure
+  interface TmdlTableInfo {
+    name: string;
+    partPath: string;
+    content: string;
+    measures: Array<{ name: string; expression: string; formatString?: string }>;
+    columns: Array<{ name: string; isHidden?: boolean; isKey?: boolean }>;
+    hasDescription: boolean;
+    isHidden: boolean;
+  }
 
-  // Keep original payload for rollback if upload fails
-  const originalPayload = bimPart.payload;
+  const tmdlTables: TmdlTableInfo[] = [];
+  if (isTmdl) {
+    for (const part of tmdlParts) {
+      if (!part.path.includes("/tables/")) continue;
+      const content = Buffer.from(part.payload, "base64").toString("utf-8");
+      const nameMatch = content.match(/^table\s+['"']?(.+?)['"']?\s*$/m) ?? content.match(/^table\s+(.+)$/m);
+      const tableName = nameMatch ? nameMatch[1].replace(/^'|'$/g, "") : part.path.split("/").pop()?.replace(".tmdl", "") ?? "";
 
-  const tables = (modelDef.tables ?? []) as Array<Record<string, unknown>>;
+      const measures: TmdlTableInfo["measures"] = [];
+      const measureBlocks = content.matchAll(/\tmeasure\s+['"']?(.+?)['"']?\s*=\s*([\s\S]*?)(?=\n\t(?:measure|column|partition|annotation|hierarchy)|\n\n|\Z)/g);
+      for (const mb of measureBlocks) {
+        const mName = mb[1].replace(/^'|'$/g, "");
+        const expr = mb[2].trim();
+        const fmtMatch = expr.match(/formatString:\s*(.+)/);
+        measures.push({ name: mName, expression: expr, formatString: fmtMatch?.[1]?.trim() });
+      }
+
+      const columns: TmdlTableInfo["columns"] = [];
+      const colBlocks = content.matchAll(/\tcolumn\s+['"']?(.+?)['"']?\s*$/gm);
+      for (const cb of colBlocks) {
+        const cName = cb[1].replace(/^'|'$/g, "");
+        const isHidden = content.includes(`isHidden`) && content.indexOf(cName) < content.indexOf("isHidden");
+        columns.push({ name: cName, isHidden });
+      }
+
+      tmdlTables.push({
+        name: tableName,
+        partPath: part.path,
+        content,
+        measures,
+        columns,
+        hasDescription: /\tdescription\s*[:=]/.test(content),
+        isHidden: /\tisHidden/.test(content.split("\n").slice(0, 5).join("\n")),
+      });
+    }
+  }
+
+  const tables = bimPart
+    ? ((modelDef!.tables ?? []) as Array<Record<string, unknown>>)
+    : ([] as Array<Record<string, unknown>>);
   const ruleIds = args.ruleIds ?? ["SM-FIX-FORMAT", "SM-FIX-DESC", "SM-FIX-HIDDEN", "SM-FIX-DATE", "SM-FIX-KEY", "SM-FIX-AUTODATE"];
   let modified = false;
 
@@ -961,7 +1022,7 @@ export async function semanticModelFix(args: {
 
       if (ruleId === "SM-FIX-KEY") {
         // Set IsKey on PK columns in relationship targets
-        const relationships = (modelDef.relationships ?? []) as Array<Record<string, unknown>>;
+        const relationships = (modelDef?.relationships ?? []) as Array<Record<string, unknown>>;
         for (const rel of relationships) {
           const toTable = tables.find(t => t.name === rel.toTable);
           if (toTable) {
@@ -979,7 +1040,7 @@ export async function semanticModelFix(args: {
 
       if (ruleId === "SM-FIX-AUTODATE") {
         // Remove auto-date tables (only if no relationships reference them)
-        const relationships = (modelDef.relationships ?? []) as Array<Record<string, unknown>>;
+        const relationships = (modelDef?.relationships ?? []) as Array<Record<string, unknown>>;
         const relationshipTargets = new Set([
           ...relationships.map(r => r.fromTable as string),
           ...relationships.map(r => r.toTable as string),
@@ -1010,27 +1071,81 @@ export async function semanticModelFix(args: {
     }
   }
 
-  // 4. Upload modified model.bim
+  // TMDL-specific fixes: apply text-based transformations on .tmdl files
+  if (isTmdl && tmdlTables.length > 0) {
+    for (const tbl of tmdlTables) {
+      let tmdlContent = tbl.content;
+      let tblModified = false;
+
+      // SM-FIX-DESC: Add description to tables without one
+      if (ruleIds.includes("SM-FIX-DESC") && !tbl.hasDescription && !tbl.isHidden) {
+        // Insert description after the table declaration line
+        tmdlContent = tmdlContent.replace(
+          /^(table\s+.+)$/m,
+          `$1\n\tdescription: Table: ${tbl.name}`
+        );
+        results.push(`| SM-FIX-DESC | ✅ | Added description to table ${tbl.name} |`);
+        totalFixed++;
+        tblModified = true;
+      }
+
+      // SM-FIX-FORMAT: Add format strings to measures without one
+      if (ruleIds.includes("SM-FIX-FORMAT")) {
+        for (const m of tbl.measures) {
+          if (!m.formatString) {
+            const nameLower = m.name.toLowerCase();
+            let fmt = "#,0";
+            if (nameLower.includes("pct") || nameLower.includes("percent") || nameLower.includes("ratio") || nameLower.includes("rate")) {
+              fmt = "0.0%";
+            } else if (nameLower.includes("price") || nameLower.includes("cost") || nameLower.includes("revenue")
+              || nameLower.includes("amount") || nameLower.includes("sales") || nameLower.includes("profit")) {
+              fmt = "$#,##0.00";
+            } else if (nameLower.includes("avg") || nameLower.includes("average")) {
+              fmt = "#,##0.00";
+            }
+            // Find the measure block and add formatString
+            const measurePattern = new RegExp(`(\\tmeasure\\s+['"']?${escapeRegexSm(m.name)}['"']?\\s*=)`, "m");
+            if (measurePattern.test(tmdlContent)) {
+              tmdlContent = tmdlContent.replace(measurePattern, `$1\n\t\tformatString: ${fmt}\n`);
+              results.push(`| SM-FIX-FORMAT | ✅ | Added format "${fmt}" to ${tbl.name}[${m.name}] |`);
+              totalFixed++;
+              tblModified = true;
+            }
+          }
+        }
+      }
+
+      if (tblModified) {
+        // Update the part payload
+        const partIndex = parts.findIndex(p => p.path === tbl.partPath);
+        if (partIndex >= 0) {
+          parts[partIndex] = {
+            ...parts[partIndex],
+            payload: Buffer.from(tmdlContent, "utf-8").toString("base64"),
+          };
+          modified = true;
+        }
+      }
+    }
+  }
+
+  // 4. Upload modified definition (BIM or TMDL)
   if (modified) {
     try {
-      const newPayload = Buffer.from(JSON.stringify(bim), "utf-8").toString("base64");
-      const updatedParts = parts.map(p =>
-        p.path === bimPart.path ? { ...p, payload: newPayload } : p
-      );
-      await updateSemanticModelDefinition(args.workspaceId, args.semanticModelId, updatedParts);
+      if (bimPart && bim) {
+        const newPayload = Buffer.from(JSON.stringify(bim), "utf-8").toString("base64");
+        const updatedParts = parts.map(p =>
+          p.path === bimPart.path ? { ...p, payload: newPayload } : p
+        );
+        await updateSemanticModelDefinition(args.workspaceId, args.semanticModelId, updatedParts);
+      } else {
+        // TMDL — parts already updated in-place
+        await updateSemanticModelDefinition(args.workspaceId, args.semanticModelId, parts);
+      }
       results.push(`| UPLOAD | ✅ | Model definition updated successfully |`);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      // Attempt rollback with original payload
-      try {
-        const rollbackParts = parts.map(p =>
-          p.path === bimPart.path ? { ...p, payload: originalPayload } : p
-        );
-        await updateSemanticModelDefinition(args.workspaceId, args.semanticModelId, rollbackParts);
-        results.push(`| UPLOAD | ❌ | Failed: ${msg.substring(0, 80)} (rolled back to original) |`);
-      } catch {
-        results.push(`| UPLOAD | ❌ | Failed: ${msg.substring(0, 80)} (rollback also failed — check model manually) |`);
-      }
+      results.push(`| UPLOAD | ❌ | Failed: ${msg.substring(0, 80)} |`);
       totalFailed++;
     }
   } else {
@@ -1048,6 +1163,10 @@ export async function semanticModelFix(args: {
     "|------|--------|--------|",
     ...results,
   ].join("\n");
+}
+
+function escapeRegexSm(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 // ──────────────────────────────────────────────
