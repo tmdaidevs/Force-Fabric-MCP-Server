@@ -3,7 +3,7 @@ import {
   getEventhouse,
   listKqlDatabases,
 } from "../clients/fabricClient.js";
-import { runKqlDiagnostics, executeKqlMgmt } from "../clients/kqlClient.js";
+import { runKqlDiagnostics, executeKqlMgmt, executeKqlQuery } from "../clients/kqlClient.js";
 import { renderRuleReport } from "./ruleEngine.js";
 import type { RuleResult } from "./ruleEngine.js";
 import type { FabricEventhouse } from "../clients/fabricClient.js";
@@ -891,6 +891,226 @@ export async function eventhouseAutoOptimize(args: {
 }
 
 // ──────────────────────────────────────────────
+// Tool: eventhouse_fix_materialized_views
+// Diagnose broken views, find correct source table, recreate
+// ──────────────────────────────────────────────
+
+export async function eventhouseFixMaterializedViews(args: {
+  workspaceId: string;
+  eventhouseId: string;
+  kqlDatabaseName?: string;
+  dryRun?: boolean;
+}): Promise<string> {
+  if (args.kqlDatabaseName) validateKqlName(args.kqlDatabaseName, "kqlDatabaseName");
+
+  const [eventhouse, kqlDatabases] = await Promise.all([
+    getEventhouse(args.workspaceId, args.eventhouseId),
+    listKqlDatabases(args.workspaceId),
+  ]);
+
+  const queryUri = eventhouse.properties?.queryServiceUri;
+  if (!queryUri) return "❌ No query URI available.";
+
+  const ehDbIds = new Set(eventhouse.properties?.databasesItemIds ?? []);
+  const ehDatabases = kqlDatabases.filter(db => ehDbIds.has(db.id));
+  const databases = args.kqlDatabaseName
+    ? ehDatabases.filter(db => db.displayName === args.kqlDatabaseName)
+    : (ehDatabases.length > 0 ? ehDatabases : kqlDatabases);
+
+  const isDryRun = args.dryRun ?? false;
+  const lines: string[] = [
+    `# 🔧 Materialized View Fix: ${eventhouse.displayName}`,
+    "",
+    `_${isDryRun ? "DRY RUN" : "Executing"} at ${new Date().toISOString()}_`,
+    "",
+  ];
+
+  let totalFixed = 0;
+  let totalFailed = 0;
+  let totalSkipped = 0;
+
+  for (const db of databases) {
+    validateKqlName(db.displayName, "database name");
+
+    // 1. Get all materialized views with full details
+    let viewRows: KqlRow[];
+    try {
+      viewRows = await executeKqlMgmt(queryUri, db.displayName,
+        ".show materialized-views | project Name, SourceTable, Query, IsHealthy, IsEnabled");
+    } catch {
+      lines.push(`**${db.displayName}**: ⚠️ Could not query materialized views.\n`);
+      continue;
+    }
+
+    if (viewRows.length === 0) {
+      lines.push(`**${db.displayName}**: No materialized views found.\n`);
+      continue;
+    }
+
+    // 2. Get existing tables
+    let tableRows: KqlRow[];
+    try {
+      tableRows = await executeKqlMgmt(queryUri, db.displayName,
+        ".show tables | project TableName");
+    } catch {
+      lines.push(`**${db.displayName}**: ⚠️ Could not list tables.\n`);
+      continue;
+    }
+    const existingTables = new Set(tableRows.map(r => String(r.TableName ?? r.tableName ?? "")));
+
+    // 3. Get table schemas for matching
+    const tableSchemas: Record<string, string[]> = {};
+    for (const tName of existingTables) {
+      if (!tName) continue;
+      try {
+        const schemaRows = await executeKqlMgmt(queryUri, db.displayName,
+          `.show table ['${tName}'] schema as json`);
+        if (schemaRows.length > 0) {
+          const schemaJson = String(schemaRows[0].Schema ?? schemaRows[0].schema ?? "{}");
+          const parsed = JSON.parse(schemaJson);
+          const cols = (parsed.OrderedColumns ?? []).map((c: { Name: string }) => c.Name);
+          tableSchemas[tName] = cols;
+        }
+      } catch {
+        // Skip schema fetch failures
+      }
+    }
+
+    // 4. Analyze each view
+    lines.push(`## Database: ${db.displayName}\n`);
+    lines.push("| View | Status | Source Table | Issue | Action |");
+    lines.push("|------|--------|-------------|-------|--------|");
+
+    for (const view of viewRows) {
+      const viewName = String(view.Name ?? view.name ?? "");
+      const sourceTable = String(view.SourceTable ?? view.sourceTable ?? "");
+      const query = String(view.Query ?? view.query ?? "");
+      const isHealthy = view.IsHealthy === true || view.IsHealthy === 1 || view.IsHealthy === "True";
+      const isEnabled = view.IsEnabled === true || view.IsEnabled === 1 || view.IsEnabled === "True";
+
+      if (!viewName) continue;
+
+      // Healthy view — skip
+      if (isHealthy && isEnabled) {
+        lines.push(`| ${viewName} | ✅ Healthy | ${sourceTable} | None | — |`);
+        totalSkipped++;
+        continue;
+      }
+
+      // Check if source table exists
+      const sourceExists = existingTables.has(sourceTable);
+
+      if (sourceExists) {
+        // Source exists but view is unhealthy — try re-enabling
+        if (!isEnabled) {
+          if (isDryRun) {
+            lines.push(`| ${viewName} | 🔍 Preview | ${sourceTable} | Disabled | \`.enable materialized-view ['${viewName}']\` |`);
+          } else {
+            try {
+              await executeKqlMgmt(queryUri, db.displayName, `.enable materialized-view ['${viewName}']`);
+              lines.push(`| ${viewName} | ✅ Fixed | ${sourceTable} | Was disabled | Re-enabled |`);
+              totalFixed++;
+            } catch (e) {
+              const msg = e instanceof Error ? e.message : String(e);
+              lines.push(`| ${viewName} | ❌ Failed | ${sourceTable} | Disabled | ${msg.substring(0, 80)} |`);
+              totalFailed++;
+            }
+          }
+        } else {
+          lines.push(`| ${viewName} | ⚠️ Unhealthy | ${sourceTable} | Source exists but view broken | Manual investigation needed |`);
+          totalSkipped++;
+        }
+        continue;
+      }
+
+      // Source table missing — find best replacement by matching columns in the query
+      const queryColumns = extractColumnsFromQuery(query);
+      let bestMatch: string | null = null;
+      let bestScore = 0;
+
+      for (const [tName, cols] of Object.entries(tableSchemas)) {
+        if (tName === sourceTable) continue;
+        const colSet = new Set(cols);
+        const matchCount = queryColumns.filter(c => colSet.has(c)).length;
+        const score = queryColumns.length > 0 ? matchCount / queryColumns.length : 0;
+        if (score > bestScore) {
+          bestScore = score;
+          bestMatch = tName;
+        }
+      }
+
+      if (!bestMatch || bestScore < 0.5) {
+        lines.push(`| ${viewName} | ❌ Broken | ${sourceTable} | Source missing, no match found | Manual fix needed |`);
+        totalFailed++;
+        continue;
+      }
+
+      // Rewrite the query to use the new source table
+      const newQuery = query.replace(new RegExp(escapeRegex(sourceTable), "g"), bestMatch);
+
+      if (isDryRun) {
+        lines.push(`| ${viewName} | 🔍 Preview | ${sourceTable} → **${bestMatch}** (${Math.round(bestScore * 100)}% match) | Source renamed | Drop + recreate |`);
+      } else {
+        // Drop and recreate
+        try {
+          await executeKqlMgmt(queryUri, db.displayName, `.drop materialized-view ${viewName}`);
+          const createCmd = `.create materialized-view ${viewName} on table ${bestMatch} { ${newQuery} }`;
+          await executeKqlMgmt(queryUri, db.displayName, createCmd);
+          lines.push(`| ${viewName} | ✅ Fixed | ${sourceTable} → **${bestMatch}** | Source was renamed | Recreated |`);
+          totalFixed++;
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          lines.push(`| ${viewName} | ❌ Failed | ${sourceTable} → ${bestMatch} | ${msg.substring(0, 80)} | — |`);
+          totalFailed++;
+        }
+      }
+    }
+
+    lines.push("");
+  }
+
+  lines.push(
+    "---",
+    "",
+    isDryRun
+      ? `**${totalFixed + totalFailed} view(s) need attention** — re-run without dryRun to apply fixes.`
+      : `**${totalFixed} fixed, ${totalFailed} failed, ${totalSkipped} skipped/healthy**`,
+  );
+
+  return lines.join("\n");
+}
+
+/** Extract column names referenced in a KQL query. */
+function extractColumnsFromQuery(query: string): string[] {
+  // Match identifiers that appear after | summarize, by, or standalone column refs
+  const cols = new Set<string>();
+  // Match patterns like func(column_name) or by column_name
+  const patterns = [
+    /\b(?:avg|sum|count|dcount|stdev|min|max|percentile)\s*\(\s*(\w+)\s*\)/gi,
+    /\bby\s+(.+)/gi,
+  ];
+  for (const pat of patterns) {
+    let m;
+    while ((m = pat.exec(query)) !== null) {
+      // For 'by' clause, split on comma
+      if (m[0].startsWith("by")) {
+        const byCols = m[1].split(",").map(s => s.trim().split(/\s/)[0]);
+        for (const c of byCols) {
+          if (/^\w+$/.test(c)) cols.add(c);
+        }
+      } else {
+        cols.add(m[1]);
+      }
+    }
+  }
+  return [...cols];
+}
+
+function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// ──────────────────────────────────────────────
 // Tool definitions for MCP registration
 // ──────────────────────────────────────────────
 
@@ -993,5 +1213,27 @@ export const eventhouseTools = [
       required: ["workspaceId", "eventhouseId"],
     },
     handler: eventhouseAutoOptimize,
+  },
+  {
+    name: "eventhouse_fix_materialized_views",
+    description:
+      "AUTO-FIX: Diagnoses and repairs broken materialized views in a Fabric Eventhouse. " +
+      "Detects: disabled views, missing/renamed source tables. " +
+      "Auto-matches renamed tables by column schema similarity, then drops and recreates views. " +
+      "Use dryRun=true to preview changes.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        workspaceId: { type: "string", description: "The ID of the Fabric workspace" },
+        eventhouseId: { type: "string", description: "The ID of the eventhouse" },
+        kqlDatabaseName: { type: "string", description: "Optional: specific KQL database name" },
+        dryRun: {
+          type: "boolean",
+          description: "If true, preview fixes without executing (default: false)",
+        },
+      },
+      required: ["workspaceId", "eventhouseId"],
+    },
+    handler: eventhouseFixMaterializedViews,
   },
 ];
