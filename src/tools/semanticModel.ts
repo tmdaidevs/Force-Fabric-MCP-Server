@@ -2017,6 +2017,39 @@ async function semanticModelFixFallback(
         }
       }
 
+      // SM-FIX-HIDEDESC: Hide description/comment columns in TMDL
+      if (ruleIds.includes("SM-FIX-HIDEDESC")) {
+        for (const col of tbl.columns) {
+          const colLower = col.name.toLowerCase();
+          if ((colLower.includes("description") || colLower.includes("comment") || colLower.includes("remark") || colLower.includes("note")) && !col.isHidden) {
+            // Add isHidden after the column declaration line
+            const colPattern = new RegExp(`(\\tcolumn\\s+['"']?${escapeRegexSm(col.name)}['"']?\\s*\\n)`, "m");
+            if (colPattern.test(tmdlContent)) {
+              tmdlContent = tmdlContent.replace(colPattern, `$1\t\tisHidden\n`);
+              results.push(`| SM-FIX-HIDEDESC | ✅ | Hidden ${tbl.name}[${col.name}] (description column) |`);
+              totalFixed++;
+              tblModified = true;
+            }
+          }
+        }
+      }
+
+      // SM-FIX-HIDEGUID: Hide GUID/UUID columns in TMDL
+      if (ruleIds.includes("SM-FIX-HIDEGUID")) {
+        for (const col of tbl.columns) {
+          const colLower = col.name.toLowerCase();
+          if ((colLower.includes("guid") || colLower.includes("uuid") || colLower === "correlation_id" || colLower === "request_id") && !col.isHidden) {
+            const colPattern = new RegExp(`(\\tcolumn\\s+['"']?${escapeRegexSm(col.name)}['"']?\\s*\\n)`, "m");
+            if (colPattern.test(tmdlContent)) {
+              tmdlContent = tmdlContent.replace(colPattern, `$1\t\tisHidden\n`);
+              results.push(`| SM-FIX-HIDEGUID | ✅ | Hidden ${tbl.name}[${col.name}] (GUID column) |`);
+              totalFixed++;
+              tblModified = true;
+            }
+          }
+        }
+      }
+
       if (tblModified) {
         const partIndex = parts.findIndex(p => p.path === tbl.partPath);
         if (partIndex >= 0) {
