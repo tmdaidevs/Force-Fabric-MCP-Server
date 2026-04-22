@@ -947,7 +947,11 @@ export async function semanticModelFix(args: {
   const tables = bimPart
     ? ((modelDef!.tables ?? []) as Array<Record<string, unknown>>)
     : ([] as Array<Record<string, unknown>>);
-  const ruleIds = args.ruleIds ?? ["SM-FIX-FORMAT", "SM-FIX-DESC", "SM-FIX-HIDDEN", "SM-FIX-DATE", "SM-FIX-KEY", "SM-FIX-AUTODATE"];
+  const ruleIds = args.ruleIds ?? [
+    "SM-FIX-FORMAT", "SM-FIX-DESC", "SM-FIX-HIDDEN", "SM-FIX-DATE", "SM-FIX-KEY", "SM-FIX-AUTODATE",
+    "SM-FIX-IFERROR", "SM-FIX-EVALLOG", "SM-FIX-ADDZERO", "SM-FIX-DIRECTREF", "SM-FIX-SUMX",
+    "SM-FIX-MEASUREDESC", "SM-FIX-MEASURENAME", "SM-FIX-HIDEDESC", "SM-FIX-HIDEGUID", "SM-FIX-CONSTCOL",
+  ];
   let modified = false;
 
   // 3. Apply fixes
@@ -1063,6 +1067,213 @@ export async function semanticModelFix(args: {
           results.push(`| SM-FIX-AUTODATE | ✅ | Removed ${removed} auto-date table(s) |`);
           totalFixed += removed;
           modified = true;
+        }
+      }
+
+      // ── NEW DAX FIXES ──────────────────────────────────────
+
+      if (ruleId === "SM-FIX-IFERROR") {
+        // Replace IFERROR(expr, alt) → IF(ISERROR(expr), alt, expr)
+        for (const table of tables) {
+          const measures = (table.measures ?? []) as Array<Record<string, unknown>>;
+          for (const m of measures) {
+            const expr = (m.expression as string) ?? "";
+            if (/iferror\s*\(/i.test(expr)) {
+              // Simple pattern: IFERROR(expr, replacement)
+              const newExpr = expr.replace(
+                /IFERROR\s*\(\s*((?:[^(),]+|\((?:[^()]*|\([^()]*\))*\))*)\s*,\s*((?:[^(),]+|\((?:[^()]*|\([^()]*\))*\))*)\s*\)/gi,
+                "IF(ISERROR($1), $2, $1)"
+              );
+              if (newExpr !== expr) {
+                m.expression = newExpr;
+                results.push(`| SM-FIX-IFERROR | ✅ | Fixed ${table.name}[${m.name}] — replaced IFERROR with IF(ISERROR()) |`);
+                totalFixed++;
+                modified = true;
+              }
+            }
+          }
+        }
+      }
+
+      if (ruleId === "SM-FIX-EVALLOG") {
+        // Strip EVALUATEANDLOG() wrapper — keep inner expression
+        for (const table of tables) {
+          const measures = (table.measures ?? []) as Array<Record<string, unknown>>;
+          for (const m of measures) {
+            const expr = (m.expression as string) ?? "";
+            if (/evaluateandlog\s*\(/i.test(expr)) {
+              const newExpr = expr.replace(/EVALUATEANDLOG\s*\(\s*/gi, "").replace(/\)\s*$/, "");
+              if (newExpr !== expr) {
+                m.expression = newExpr;
+                results.push(`| SM-FIX-EVALLOG | ✅ | Fixed ${table.name}[${m.name}] — removed EVALUATEANDLOG |`);
+                totalFixed++;
+                modified = true;
+              }
+            }
+          }
+        }
+      }
+
+      if (ruleId === "SM-FIX-ADDZERO") {
+        // Remove +0 / 0+ from measure expressions
+        for (const table of tables) {
+          const measures = (table.measures ?? []) as Array<Record<string, unknown>>;
+          for (const m of measures) {
+            const expr = (m.expression as string) ?? "";
+            // Match trailing "+0" or leading "0+"
+            const newExpr = expr
+              .replace(/\s*\+\s*0\s*$/g, "")
+              .replace(/^\s*0\s*\+\s*/g, "");
+            if (newExpr !== expr && newExpr.trim().length > 0) {
+              m.expression = newExpr;
+              results.push(`| SM-FIX-ADDZERO | ✅ | Fixed ${table.name}[${m.name}] — removed +0 |`);
+              totalFixed++;
+              modified = true;
+            }
+          }
+        }
+      }
+
+      if (ruleId === "SM-FIX-DIRECTREF") {
+        // Remove measures that are just direct references of other measures [OtherMeasure]
+        for (const table of tables) {
+          const measures = (table.measures ?? []) as Array<Record<string, unknown>>;
+          const allMeasureNames = new Set(measures.map(m => m.name as string));
+          const toRemove: string[] = [];
+          for (const m of measures) {
+            const expr = ((m.expression as string) ?? "").trim();
+            const refMatch = expr.match(/^\[([^\]]+)\]$/);
+            if (refMatch && allMeasureNames.has(refMatch[1]) && refMatch[1] !== m.name) {
+              toRemove.push(m.name as string);
+            }
+          }
+          if (toRemove.length > 0) {
+            table.measures = measures.filter(m => !toRemove.includes(m.name as string));
+            for (const name of toRemove) {
+              results.push(`| SM-FIX-DIRECTREF | ✅ | Removed duplicate measure ${table.name}[${name}] |`);
+              totalFixed++;
+            }
+            modified = true;
+          }
+        }
+      }
+
+      if (ruleId === "SM-FIX-SUMX") {
+        // Replace SUMX('Table', 'Table'[Col]) → SUM('Table'[Col])
+        for (const table of tables) {
+          const measures = (table.measures ?? []) as Array<Record<string, unknown>>;
+          for (const m of measures) {
+            const expr = (m.expression as string) ?? "";
+            // Match SUMX('TableName', 'TableName'[ColumnName])
+            const newExpr = expr.replace(
+              /SUMX\s*\(\s*'?([^',\)]+)'?\s*,\s*'?\1'?\s*\[([^\]]+)\]\s*\)/gi,
+              "SUM('$1'[$2])"
+            );
+            if (newExpr !== expr) {
+              m.expression = newExpr;
+              results.push(`| SM-FIX-SUMX | ✅ | Fixed ${table.name}[${m.name}] — SUMX→SUM |`);
+              totalFixed++;
+              modified = true;
+            }
+          }
+        }
+      }
+
+      // ── NEW MODEL PROPERTY FIXES ───────────────────────────
+
+      if (ruleId === "SM-FIX-MEASUREDESC") {
+        // Add auto-generated descriptions to measures without one
+        for (const table of tables) {
+          const measures = (table.measures ?? []) as Array<Record<string, unknown>>;
+          for (const m of measures) {
+            if (!m.isHidden && (!m.description || (m.description as string).length === 0)) {
+              const expr = ((m.expression as string) ?? "").trim();
+              // Generate description from expression (first 100 chars)
+              const shortExpr = expr.length > 100 ? expr.substring(0, 100) + "..." : expr;
+              m.description = `Measure: ${m.name} = ${shortExpr}`;
+              results.push(`| SM-FIX-MEASUREDESC | ✅ | Added description to ${table.name}[${m.name}] |`);
+              totalFixed++;
+              modified = true;
+            }
+          }
+        }
+      }
+
+      if (ruleId === "SM-FIX-MEASURENAME") {
+        // Trim whitespace/tabs/newlines from measure names
+        for (const table of tables) {
+          const measures = (table.measures ?? []) as Array<Record<string, unknown>>;
+          for (const m of measures) {
+            const name = (m.name as string) ?? "";
+            const cleaned = name.replace(/[\t\r\n]/g, " ").replace(/^\s+|\s+$/g, "").replace(/\s{2,}/g, " ");
+            if (cleaned !== name) {
+              m.name = cleaned;
+              results.push(`| SM-FIX-MEASURENAME | ✅ | Cleaned name: "${name}" → "${cleaned}" |`);
+              totalFixed++;
+              modified = true;
+            }
+          }
+        }
+      }
+
+      if (ruleId === "SM-FIX-HIDEDESC") {
+        // Hide description/comment columns (they bloat the model)
+        for (const table of tables) {
+          const columns = (table.columns ?? []) as Array<Record<string, unknown>>;
+          for (const col of columns) {
+            const colName = ((col.name as string) ?? "").toLowerCase();
+            if ((colName.includes("description") || colName.includes("comment") || colName.includes("remark") || colName.includes("note"))
+              && !col.isHidden) {
+              col.isHidden = true;
+              col.isAvailableInMDX = false;
+              results.push(`| SM-FIX-HIDEDESC | ✅ | Hidden ${table.name}[${col.name}] (description column) |`);
+              totalFixed++;
+              modified = true;
+            }
+          }
+        }
+      }
+
+      if (ruleId === "SM-FIX-HIDEGUID") {
+        // Hide GUID/UUID columns
+        for (const table of tables) {
+          const columns = (table.columns ?? []) as Array<Record<string, unknown>>;
+          for (const col of columns) {
+            const colName = ((col.name as string) ?? "").toLowerCase();
+            if ((colName.includes("guid") || colName.includes("uuid") || colName === "correlation_id" || colName === "request_id")
+              && !col.isHidden) {
+              col.isHidden = true;
+              col.isAvailableInMDX = false;
+              results.push(`| SM-FIX-HIDEGUID | ✅ | Hidden ${table.name}[${col.name}] (GUID column) |`);
+              totalFixed++;
+              modified = true;
+            }
+          }
+        }
+      }
+
+      if (ruleId === "SM-FIX-CONSTCOL") {
+        // Remove constant columns (columns with only 1 distinct value)
+        // Only works if we have column statistics — check annotations
+        for (const table of tables) {
+          const columns = (table.columns ?? []) as Array<Record<string, unknown>>;
+          const toRemove: string[] = [];
+          for (const col of columns) {
+            // Check for annotation or known constant patterns
+            const annotations = (col.annotations ?? []) as Array<Record<string, unknown>>;
+            const cardAnnotation = annotations.find(a => a.name === "ColumnCardinality");
+            if (cardAnnotation && Number(cardAnnotation.value) <= 1) {
+              toRemove.push(col.name as string);
+            }
+          }
+          if (toRemove.length > 0) {
+            table.columns = columns.filter(c => !toRemove.includes(c.name as string));
+            for (const name of toRemove) {
+              results.push(`| SM-FIX-CONSTCOL | ✅ | Removed constant column ${table.name}[${name}] |`);
+              totalFixed++;
+            }
+            modified = true;
+          }
         }
       }
     } catch (error) {
@@ -1181,7 +1392,11 @@ export async function semanticModelAutoOptimize(args: {
     const model = models.find(m => m.id === args.semanticModelId);
     const modelName = model?.displayName ?? args.semanticModelId;
 
-    const allRules = ["SM-FIX-FORMAT", "SM-FIX-DESC", "SM-FIX-HIDDEN", "SM-FIX-DATE", "SM-FIX-KEY", "SM-FIX-AUTODATE"];
+    const allRules = [
+      "SM-FIX-FORMAT", "SM-FIX-DESC", "SM-FIX-HIDDEN", "SM-FIX-DATE", "SM-FIX-KEY", "SM-FIX-AUTODATE",
+      "SM-FIX-IFERROR", "SM-FIX-EVALLOG", "SM-FIX-ADDZERO", "SM-FIX-DIRECTREF", "SM-FIX-SUMX",
+      "SM-FIX-MEASUREDESC", "SM-FIX-MEASURENAME", "SM-FIX-HIDEDESC", "SM-FIX-HIDEGUID", "SM-FIX-CONSTCOL",
+    ];
     const descriptions: Record<string, string> = {
       "SM-FIX-FORMAT": "Add format strings to measures (currency, %, decimal)",
       "SM-FIX-DESC": "Add descriptions to visible tables",
@@ -1189,6 +1404,16 @@ export async function semanticModelAutoOptimize(args: {
       "SM-FIX-DATE": "Mark date/calendar tables with Time dataCategory",
       "SM-FIX-KEY": "Set IsKey=true on relationship PK columns",
       "SM-FIX-AUTODATE": "Remove orphaned auto-date tables",
+      "SM-FIX-IFERROR": "Replace IFERROR() with IF(ISERROR()) in DAX",
+      "SM-FIX-EVALLOG": "Remove EVALUATEANDLOG() debug wrappers",
+      "SM-FIX-ADDZERO": "Remove +0 anti-pattern from measures",
+      "SM-FIX-DIRECTREF": "Remove duplicate measures (direct references)",
+      "SM-FIX-SUMX": "Replace SUMX(T, T[Col]) → SUM(T[Col])",
+      "SM-FIX-MEASUREDESC": "Add auto-generated descriptions to measures",
+      "SM-FIX-MEASURENAME": "Clean whitespace/tabs from measure names",
+      "SM-FIX-HIDEDESC": "Hide description/comment columns",
+      "SM-FIX-HIDEGUID": "Hide GUID/UUID columns",
+      "SM-FIX-CONSTCOL": "Remove constant columns (1 distinct value)",
     };
 
     const lines = [
@@ -1261,10 +1486,10 @@ export const semanticModelTools = [
   {
     name: "semantic_model_fix",
     description:
-      "AUTO-FIX: Downloads model.bim, applies fixes, and uploads the modified definition. " +
-      "Can fix: missing format strings, missing descriptions, IsAvailableInMDX on hidden columns, " +
-      "mark date tables, set IsKey on PK columns, remove auto-date tables. " +
-      "Available ruleIds: SM-FIX-FORMAT, SM-FIX-DESC, SM-FIX-HIDDEN, SM-FIX-DATE, SM-FIX-KEY, SM-FIX-AUTODATE.",
+      "AUTO-FIX: Downloads model definition (BIM or TMDL), applies fixes, and uploads. " +
+      "16 fix rules: SM-FIX-FORMAT, SM-FIX-DESC, SM-FIX-HIDDEN, SM-FIX-DATE, SM-FIX-KEY, SM-FIX-AUTODATE, " +
+      "SM-FIX-IFERROR, SM-FIX-EVALLOG, SM-FIX-ADDZERO, SM-FIX-DIRECTREF, SM-FIX-SUMX, " +
+      "SM-FIX-MEASUREDESC, SM-FIX-MEASURENAME, SM-FIX-HIDEDESC, SM-FIX-HIDEGUID, SM-FIX-CONSTCOL.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -1279,9 +1504,10 @@ export const semanticModelTools = [
   {
     name: "semantic_model_auto_optimize",
     description:
-      "AUTO-OPTIMIZE: Downloads a Semantic Model definition and applies all safe fixes automatically. " +
-      "Covers: format strings on measures, descriptions on tables, IsAvailableInMDX on hidden columns, " +
-      "date table marking, IsKey on PK columns, remove orphaned auto-date tables. " +
+      "AUTO-OPTIMIZE: Downloads a Semantic Model definition and applies all 16 safe fixes automatically. " +
+      "Covers: DAX fixes (IFERROR, EVALUATEANDLOG, +0, direct refs, SUMX→SUM), " +
+      "model fixes (format strings, descriptions, date tables, IsKey, hidden MDX, auto-date tables), " +
+      "and bloat fixes (hide description/GUID columns, remove constants, clean measure names). " +
       "Use dryRun=true to preview.",
     inputSchema: {
       type: "object" as const,
