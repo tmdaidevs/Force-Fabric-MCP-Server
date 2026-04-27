@@ -570,3 +570,115 @@ export async function runTemporaryNotebook(
 export async function listCapacities(): Promise<Array<{ id: string; displayName: string; sku: string; state: string; region: string }>> {
   return fabricFetchPaginated(`/capacities`);
 }
+
+// ──────────────────────────────────────────────
+// Gateway & Connection operations
+// ──────────────────────────────────────────────
+
+export interface FabricGateway {
+  id: string;
+  type: string; // "OnPremises" | "VirtualNetwork" | "Personal"
+  displayName: string;
+  publicKey?: { exponent: string; modulus: string };
+  version?: string;
+  gatewayStatus?: string;
+  virtualNetworkAzureResource?: {
+    subscriptionId: string;
+    resourceGroupName: string;
+    virtualNetworkName: string;
+    subnetName: string;
+  };
+}
+
+export interface FabricConnection {
+  id: string;
+  displayName?: string;
+  connectivityType: string; // "ShareableCloud" | "OnPremisesGateway" | "VirtualNetworkGateway" | "PersonalCloud"
+  gatewayId?: string;
+  connectionDetails?: Record<string, unknown>;
+  credentialDetails?: Record<string, unknown>;
+  privacyLevel?: string;
+}
+
+export interface GatewayDatasource {
+  id: string;
+  gatewayId: string;
+  datasourceType: string;
+  connectionDetails: string;
+  credentialType: string;
+  datasourceName?: string;
+}
+
+export interface GatewayDatasourceUser {
+  emailAddress: string;
+  displayName: string;
+  datasourceAccessRight: string;
+  principalType: string;
+}
+
+export async function listGateways(): Promise<FabricGateway[]> {
+  return fabricFetchPaginated<FabricGateway>("/gateways");
+}
+
+export async function getGateway(gatewayId: string): Promise<FabricGateway> {
+  return fabricFetch<FabricGateway>(`/gateways/${encodeURIComponent(gatewayId)}`);
+}
+
+export async function listConnections(): Promise<FabricConnection[]> {
+  return fabricFetchPaginated<FabricConnection>("/connections");
+}
+
+export async function deleteConnection(connectionId: string): Promise<void> {
+  await fabricFetch<Record<string, never>>(`/connections/${encodeURIComponent(connectionId)}`, { method: "DELETE" });
+}
+
+// Power BI REST API for gateway datasources (different base URL)
+const POWERBI_API_BASE = "https://api.powerbi.com/v1.0/myorg";
+
+async function powerbiFetch<T>(path: string, options: FabricRequestOptions = {}): Promise<T> {
+  const token = await getAccessToken();
+  const { method = "GET", body } = options;
+  const url = `${POWERBI_API_BASE}${path}`;
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+  };
+  const fetchOptions: RequestInit = { method, headers };
+  if (body) fetchOptions.body = JSON.stringify(body);
+  const response = await fetch(url, fetchOptions);
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Power BI API error (${response.status}): ${errorText}`);
+  }
+  if (response.status === 204 || (response.status === 200 && response.headers.get("content-length") === "0")) {
+    return {} as T;
+  }
+  return response.json() as Promise<T>;
+}
+
+export async function listGatewayDatasources(gatewayId: string): Promise<GatewayDatasource[]> {
+  const result = await powerbiFetch<{ value: GatewayDatasource[] }>(`/gateways/${encodeURIComponent(gatewayId)}/datasources`);
+  return result.value ?? [];
+}
+
+export async function getGatewayDatasourceStatus(gatewayId: string, datasourceId: string): Promise<string> {
+  try {
+    await powerbiFetch<void>(`/gateways/${encodeURIComponent(gatewayId)}/datasources/${encodeURIComponent(datasourceId)}/status`);
+    return "OK";
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+}
+
+export async function listGatewayDatasourceUsers(gatewayId: string, datasourceId: string): Promise<GatewayDatasourceUser[]> {
+  const result = await powerbiFetch<{ value: GatewayDatasourceUser[] }>(`/gateways/${encodeURIComponent(gatewayId)}/datasources/${encodeURIComponent(datasourceId)}/users`);
+  return result.value ?? [];
+}
+
+export async function deleteGatewayDatasource(gatewayId: string, datasourceId: string): Promise<void> {
+  await powerbiFetch<void>(`/gateways/${encodeURIComponent(gatewayId)}/datasources/${encodeURIComponent(datasourceId)}`, { method: "DELETE" });
+}
+
+export async function deleteGatewayDatasourceUser(gatewayId: string, datasourceId: string, emailAddress: string): Promise<void> {
+  await powerbiFetch<void>(`/gateways/${encodeURIComponent(gatewayId)}/datasources/${encodeURIComponent(datasourceId)}/users/${encodeURIComponent(emailAddress)}`, { method: "DELETE" });
+}

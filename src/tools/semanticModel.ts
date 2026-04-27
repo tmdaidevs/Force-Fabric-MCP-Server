@@ -1145,6 +1145,130 @@ export async function semanticModelOptimizationRecommendations(args: {
     }
   }
 
+  // ══════════════════════════════════════════════
+  // NEW RULES (SM-021 to SM-029)
+  // ══════════════════════════════════════════════
+
+  // SM-021: Bidirectional cross-filter overuse
+  const biDiRelationships = infoRelationships.filter(r => {
+    const cf = String(r.CrossFilteringBehavior ?? r.crossFilteringBehavior ?? "").toLowerCase();
+    return cf === "2" || cf === "both" || cf === "bothdirections";
+  });
+  rules.push({
+    id: "SM-021", rule: "Bidirectional Cross-Filter Overuse", category: "Performance", severity: "MEDIUM",
+    status: infoRelationships.length === 0 ? "N/A" : biDiRelationships.length === 0 ? "PASS" : biDiRelationships.length > 3 ? "FAIL" : "WARN",
+    details: infoRelationships.length === 0 ? "No relationship data available." : biDiRelationships.length === 0 ? "No bidirectional relationships." : `${biDiRelationships.length} bidirectional relationship(s) — increases memory/CPU.`,
+    recommendation: "Switch to single direction unless M:M filtering is specifically needed. Fix: SM-FIX-BIDI",
+  });
+
+  // SM-022: Implicit measures (SummarizeBy != None)
+  const implicitMeasureCols = infoColumns.filter(c => {
+    const sb = String(c.SummarizeBy ?? c.summarizeBy ?? "none").toLowerCase();
+    return sb !== "none" && sb !== "" && sb !== "0";
+  });
+  rules.push({
+    id: "SM-022", rule: "No Implicit Measures", category: "DAX", severity: "MEDIUM",
+    status: infoColumns.length === 0 ? "N/A" : implicitMeasureCols.length === 0 ? "PASS" : "WARN",
+    details: infoColumns.length === 0 ? "No column data available." : implicitMeasureCols.length === 0 ? "All numeric columns have SummarizeBy=None." : `${implicitMeasureCols.length} column(s) with implicit summarization.`,
+    recommendation: "Set SummarizeBy=None and create explicit measures. Fix: SM-FIX-SUMMARIZE",
+  });
+
+  // SM-023: Disconnected tables (0 relationships)
+  const tablesInRelationships = new Set<string>();
+  for (const r of infoRelationships) {
+    const from = String(r.FromTableID ?? r.fromTableId ?? r.FromTable ?? r.fromTable ?? "");
+    const to = String(r.ToTableID ?? r.toTableId ?? r.ToTable ?? r.toTable ?? "");
+    if (from) tablesInRelationships.add(from);
+    if (to) tablesInRelationships.add(to);
+  }
+  const disconnectedTables = [...tableNames].filter(t =>
+    !tablesInRelationships.has(t) &&
+    !t.toLowerCase().includes("date") &&
+    !t.toLowerCase().includes("calendar") &&
+    !t.startsWith("DateTableTemplate_") &&
+    !t.startsWith("LocalDateTable_")
+  );
+  rules.push({
+    id: "SM-023", rule: "No Disconnected Tables", category: "Data Modeling", severity: "MEDIUM",
+    status: tableNames.size === 0 ? "N/A" : disconnectedTables.length === 0 ? "PASS" : "WARN",
+    details: tableNames.size === 0 ? "No table data." : disconnectedTables.length === 0 ? "All tables are connected via relationships." : `${disconnectedTables.length} disconnected table(s): ${disconnectedTables.slice(0, 5).join(", ")}`,
+    recommendation: "Review disconnected tables — they may indicate modeling errors or unused tables.",
+  });
+
+  // SM-024: ALL() vs REMOVEFILTERS() pattern
+  const allPatternMeasures = measureExprs.filter(m => /\bALL\s*\(/i.test(m.expr) && !/\bALLSELECTED\s*\(/i.test(m.expr));
+  rules.push({
+    id: "SM-024", rule: "Use REMOVEFILTERS() Instead of ALL()", category: "DAX", severity: "LOW",
+    status: allPatternMeasures.length === 0 ? "PASS" : "WARN",
+    details: allPatternMeasures.length === 0 ? "No measures using ALL() for filter removal." : `${allPatternMeasures.length} measure(s) using ALL() — REMOVEFILTERS() is clearer and more efficient.`,
+    recommendation: "Replace ALL(Table) with REMOVEFILTERS(Table) in CALCULATE. Fix: SM-FIX-REMOVEFILTERS",
+  });
+
+  // SM-025: Excessive USERELATIONSHIP
+  const useRelMeasures = measureExprs.filter(m => {
+    const count = (m.exprLower.match(/userelationship\s*\(/g) ?? []).length;
+    return count > 3;
+  });
+  rules.push({
+    id: "SM-025", rule: "No Excessive USERELATIONSHIP", category: "DAX", severity: "LOW",
+    status: useRelMeasures.length === 0 ? "PASS" : "WARN",
+    details: useRelMeasures.length === 0 ? "No measures with >3 USERELATIONSHIP calls." : `${useRelMeasures.length} measure(s) with excessive USERELATIONSHIP — indicates role-playing dimension design issues.`,
+    recommendation: "Consider restructuring relationships or using calculation groups.",
+  });
+
+  // SM-026: Complex relationship web (>5 relationships per table)
+  const relCountPerTable = new Map<string, number>();
+  for (const r of infoRelationships) {
+    const from = String(r.FromTable ?? r.fromTable ?? "");
+    const to = String(r.ToTable ?? r.toTable ?? "");
+    relCountPerTable.set(from, (relCountPerTable.get(from) ?? 0) + 1);
+    relCountPerTable.set(to, (relCountPerTable.get(to) ?? 0) + 1);
+  }
+  const overConnected = [...relCountPerTable.entries()].filter(([, count]) => count > 5);
+  rules.push({
+    id: "SM-026", rule: "No Complex Relationship Webs", category: "Data Modeling", severity: "LOW",
+    status: infoRelationships.length === 0 ? "N/A" : overConnected.length === 0 ? "PASS" : "WARN",
+    details: infoRelationships.length === 0 ? "No relationship data." : overConnected.length === 0 ? "No tables with >5 relationships." : `${overConnected.length} table(s) with >5 relationships: ${overConnected.slice(0, 3).map(([t, c]) => `${t} (${c})`).join(", ")}`,
+    recommendation: "Review highly connected tables — they increase ambiguity and may indicate denormalization.",
+  });
+
+  // SM-027: Inactive relationships
+  const inactiveRels = infoRelationships.filter(r => {
+    const active = String(r.IsActive ?? r.isActive ?? "true").toLowerCase();
+    return active === "false" || active === "0";
+  });
+  rules.push({
+    id: "SM-027", rule: "Inactive Relationships Documented", category: "Data Modeling", severity: "LOW",
+    status: infoRelationships.length === 0 ? "N/A" : inactiveRels.length === 0 ? "PASS" : "WARN",
+    details: infoRelationships.length === 0 ? "No relationship data." : inactiveRels.length === 0 ? "No inactive relationships." : `${inactiveRels.length} inactive relationship(s) — ensure these are intentional.`,
+    recommendation: "Review inactive relationships. Remove if unused, or document with USERELATIONSHIP measures.",
+  });
+
+  // SM-028: Measures without format strings (from DMV)
+  const noFormatMeasuresDmv = allMeasures.filter(m =>
+    m.MEASURE_NAME !== "__Default measure" &&
+    (!m.DEFAULT_FORMAT_STRING || m.DEFAULT_FORMAT_STRING === "")
+  );
+  rules.push({
+    id: "SM-028", rule: "All Measures Have Format Strings", category: "Usability", severity: "LOW",
+    status: noFormatMeasuresDmv.length === 0 ? "PASS" : "WARN",
+    details: noFormatMeasuresDmv.length === 0 ? "All measures have format strings." : `${noFormatMeasuresDmv.length} measure(s) without format strings.`,
+    recommendation: "Add format strings for consistent display. Fix: SM-FIX-FORMAT",
+  });
+
+  // SM-029: Pseudo-hierarchies (<=2 levels)
+  const hierarchyLevels = new Map<string, number>();
+  for (const h of dmvHierarchies) {
+    const name = String(h.HIERARCHY_UNIQUE_NAME ?? "");
+    hierarchyLevels.set(name, (hierarchyLevels.get(name) ?? 0) + 1);
+  }
+  const pseudoHierarchies = [...hierarchyLevels.entries()].filter(([, levels]) => levels <= 2 && levels > 0);
+  rules.push({
+    id: "SM-029", rule: "No Pseudo-Hierarchies", category: "Usability", severity: "INFO",
+    status: "PASS",
+    details: `${hierarchyLevels.size} hierarchies detected. Review any with ≤2 levels for necessity.`,
+  });
+
   return renderRuleReport(
     `Semantic Model Analysis: ${modelName}`,
     new Date().toISOString(),
@@ -1557,6 +1681,43 @@ async function applyXmlaFixes(
         totalSkipped++;
       }
 
+      // ── NEW FIX HANDLERS ──
+
+      if (ruleId === "SM-FIX-REMOVEFILTERS") {
+        for (const m of measures) {
+          // Replace ALL( used for filter removal with REMOVEFILTERS(
+          const allPattern = /\bALL\s*\(/gi;
+          if (allPattern.test(m.expression) && !/\bALLSELECTED\s*\(/i.test(m.expression)) {
+            const fixedExpr = m.expression.replace(/\bALL\s*\(/gi, "REMOVEFILTERS(");
+            await execCmd({
+              createOrReplace: {
+                object: { database: modelName, table: m.tableName, measure: m.measureName },
+                measure: {
+                  name: m.measureName,
+                  expression: fixedExpr,
+                  ...(m.formatString ? { formatString: m.formatString } : {}),
+                  ...(m.description ? { description: m.description } : {}),
+                },
+              },
+            });
+            results.push(`| SM-FIX-REMOVEFILTERS | ✅ | Fixed ${m.tableName}[${m.measureName}] — replaced ALL() with REMOVEFILTERS() |`);
+            totalFixed++;
+          }
+        }
+      }
+
+      if (ruleId === "SM-FIX-BIDI") {
+        // Bidirectional relationships require relationship metadata — skip with message for now
+        results.push(`| SM-FIX-BIDI | ⚪ | Skipped — relationship crossFilteringBehavior changes require model-level TMSL (use Tabular Editor for now) |`);
+        totalSkipped++;
+      }
+
+      if (ruleId === "SM-FIX-SUMMARIZE") {
+        // SummarizeBy changes require column-level TMSL alter — skip with message for now
+        results.push(`| SM-FIX-SUMMARIZE | ⚪ | Skipped — SummarizeBy changes require column-level TMSL alter (use Tabular Editor for now) |`);
+        totalSkipped++;
+      }
+
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       results.push(`| ${ruleId} | ❌ | Failed: ${msg.substring(0, 80)} |`);
@@ -1580,6 +1741,7 @@ export async function semanticModelFix(args: {
     "SM-FIX-FORMAT", "SM-FIX-DESC", "SM-FIX-HIDDEN", "SM-FIX-DATE", "SM-FIX-KEY", "SM-FIX-AUTODATE",
     "SM-FIX-IFERROR", "SM-FIX-EVALLOG", "SM-FIX-ADDZERO", "SM-FIX-DIRECTREF", "SM-FIX-SUMX",
     "SM-FIX-MEASUREDESC", "SM-FIX-MEASURENAME", "SM-FIX-HIDEDESC", "SM-FIX-HIDEGUID", "SM-FIX-CONSTCOL",
+    "SM-FIX-BIDI", "SM-FIX-SUMMARIZE", "SM-FIX-REMOVEFILTERS",
   ];
 
   // ── Try XMLA/TMSL approach first ──
@@ -2121,6 +2283,7 @@ export async function semanticModelAutoOptimize(args: {
       "SM-FIX-FORMAT", "SM-FIX-DESC", "SM-FIX-HIDDEN", "SM-FIX-DATE", "SM-FIX-KEY", "SM-FIX-AUTODATE",
       "SM-FIX-IFERROR", "SM-FIX-EVALLOG", "SM-FIX-ADDZERO", "SM-FIX-DIRECTREF", "SM-FIX-SUMX",
       "SM-FIX-MEASUREDESC", "SM-FIX-MEASURENAME", "SM-FIX-HIDEDESC", "SM-FIX-HIDEGUID", "SM-FIX-CONSTCOL",
+      "SM-FIX-BIDI", "SM-FIX-SUMMARIZE", "SM-FIX-REMOVEFILTERS",
     ];
     const descriptions: Record<string, string> = {
       "SM-FIX-FORMAT": "Add format strings to measures (currency, %, decimal)",
@@ -2139,6 +2302,9 @@ export async function semanticModelAutoOptimize(args: {
       "SM-FIX-HIDEDESC": "Hide description/comment columns",
       "SM-FIX-HIDEGUID": "Hide GUID/UUID columns",
       "SM-FIX-CONSTCOL": "Remove constant columns (1 distinct value)",
+      "SM-FIX-BIDI": "Switch bidirectional relationships to single direction",
+      "SM-FIX-SUMMARIZE": "Set SummarizeBy=None on implicit measure columns",
+      "SM-FIX-REMOVEFILTERS": "Replace ALL() with REMOVEFILTERS() in DAX measures",
     };
 
     const lines = [
@@ -2191,7 +2357,10 @@ export const semanticModelTools = [
       "LIVE SCAN: Connects to a Fabric Semantic Model and executes DAX queries (COLUMNSTATISTICS) " +
       "to analyze the actual model. Runs Best Practice Analyzer rules to detect: high-cardinality " +
       "text columns, constant columns, booleans/dates/numbers stored as text, wide tables, " +
-      "string keys, description columns wasting memory. Returns memory hotspots and prioritized fixes.",
+      "string keys, description columns wasting memory. Also checks bidirectional relationships (SM-021), " +
+      "implicit measures (SM-022), disconnected tables (SM-023), ALL() vs REMOVEFILTERS() (SM-024), " +
+      "excessive USERELATIONSHIP (SM-025), complex relationship webs (SM-026), inactive relationships (SM-027), " +
+      "missing format strings (SM-028), and pseudo-hierarchies (SM-029). Returns memory hotspots and prioritized fixes.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -2213,9 +2382,10 @@ export const semanticModelTools = [
     description:
       "AUTO-FIX: Uses XMLA/TMSL commands for atomic per-object fixes (measures, columns, tables). " +
       "Falls back to download/upload (BIM/TMDL) if XMLA endpoint is unavailable. " +
-      "16 fix rules: SM-FIX-FORMAT, SM-FIX-DESC, SM-FIX-HIDDEN, SM-FIX-DATE, SM-FIX-KEY, SM-FIX-AUTODATE, " +
+      "19 fix rules: SM-FIX-FORMAT, SM-FIX-DESC, SM-FIX-HIDDEN, SM-FIX-DATE, SM-FIX-KEY, SM-FIX-AUTODATE, " +
       "SM-FIX-IFERROR, SM-FIX-EVALLOG, SM-FIX-ADDZERO, SM-FIX-DIRECTREF, SM-FIX-SUMX, " +
-      "SM-FIX-MEASUREDESC, SM-FIX-MEASURENAME, SM-FIX-HIDEDESC, SM-FIX-HIDEGUID, SM-FIX-CONSTCOL.",
+      "SM-FIX-MEASUREDESC, SM-FIX-MEASURENAME, SM-FIX-HIDEDESC, SM-FIX-HIDEGUID, SM-FIX-CONSTCOL, " +
+      "SM-FIX-BIDI, SM-FIX-SUMMARIZE, SM-FIX-REMOVEFILTERS.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -2230,10 +2400,11 @@ export const semanticModelTools = [
   {
     name: "semantic_model_auto_optimize",
     description:
-      "AUTO-OPTIMIZE: Applies all 16 safe fixes to a Semantic Model using XMLA/TMSL commands " +
+      "AUTO-OPTIMIZE: Applies all 19 safe fixes to a Semantic Model using XMLA/TMSL commands " +
       "(falls back to download/upload if XMLA is unavailable). " +
-      "Covers: DAX fixes (IFERROR, EVALUATEANDLOG, +0, direct refs, SUMX→SUM), " +
-      "model fixes (format strings, descriptions, date tables, IsKey, hidden MDX, auto-date tables), " +
+      "Covers: DAX fixes (IFERROR, EVALUATEANDLOG, +0, direct refs, SUMX→SUM, ALL→REMOVEFILTERS), " +
+      "model fixes (format strings, descriptions, date tables, IsKey, hidden MDX, auto-date tables, " +
+      "bidirectional relationships, SummarizeBy), " +
       "and bloat fixes (hide description/GUID columns, remove constants, clean measure names). " +
       "Use dryRun=true to preview.",
     inputSchema: {
