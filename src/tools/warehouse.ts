@@ -432,6 +432,28 @@ const WAREHOUSE_DIAGNOSTICS = {
     FROM queryinsights.exec_requests_history
     WHERE start_time > DATEADD(day, -7, GETDATE())
       AND status = 'Succeeded'`,
+
+  computedColumns: `SELECT c.name AS column_name, SCHEMA_NAME(t.schema_id) AS schema_name, t.name AS table_name
+    FROM sys.computed_columns c
+    JOIN sys.tables t ON c.object_id = t.object_id`,
+  allColumns: `SELECT SCHEMA_NAME(t.schema_id) AS schema_name, t.name AS table_name, COUNT(*) AS col_count
+    FROM sys.columns c JOIN sys.tables t ON c.object_id = t.object_id
+    GROUP BY SCHEMA_NAME(t.schema_id), t.name`,
+  queryHints: `SELECT DISTINCT SCHEMA_NAME(o.schema_id) AS schema_name, o.name AS object_name, o.type_desc
+    FROM sys.sql_modules m JOIN sys.objects o ON m.object_id = o.object_id
+    WHERE m.definition LIKE '%NOLOCK%' OR m.definition LIKE '%FORCESEEK%' OR m.definition LIKE '%FORCESCAN%'`,
+  dbSettingsExtended: `SELECT 
+    is_auto_create_stats_on, is_query_store_on
+    FROM sys.databases WHERE name = DB_NAME()`,
+  fkWithoutIndex: `SELECT fk.name AS fk_name, SCHEMA_NAME(fk.schema_id) AS schema_name,
+    OBJECT_NAME(fk.parent_object_id) AS table_name,
+    COL_NAME(fkc.parent_object_id, fkc.parent_column_id) AS column_name
+    FROM sys.foreign_keys fk
+    JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
+    WHERE NOT EXISTS (
+      SELECT 1 FROM sys.index_columns ic
+      WHERE ic.object_id = fkc.parent_object_id AND ic.column_id = fkc.parent_column_id
+    )`,
 };
 
 // ──────────────────────────────────────────────
@@ -989,6 +1011,62 @@ export async function warehouseOptimizationRecommendations(args: {
     });
   }
 
+    // WH-040: AUTO_CREATE_STATISTICS enabled
+    const autoCreateStats = rows("dbSettingsExtended");
+    const autoCreateEnabled = autoCreateStats.length > 0 && autoCreateStats[0].is_auto_create_stats_on === true;
+    rules.push({
+      id: "WH-040", rule: "AUTO_CREATE_STATISTICS Enabled", category: "Performance", severity: "HIGH",
+      status: err("dbSettingsExtended") ? "ERROR" : autoCreateEnabled ? "PASS" : "FAIL",
+      details: err("dbSettingsExtended") ?? (autoCreateEnabled ? "Auto-create statistics is enabled." : "Auto-create statistics is disabled."),
+      recommendation: "Enable with: ALTER DATABASE SET AUTO_CREATE_STATISTICS ON",
+    });
+
+    // WH-041: QUERY_STORE enabled
+    const queryStoreOn = autoCreateStats.length > 0 && autoCreateStats[0].is_query_store_on === true;
+    rules.push({
+      id: "WH-041", rule: "Query Store Enabled", category: "Performance", severity: "MEDIUM",
+      status: err("dbSettingsExtended") ? "ERROR" : queryStoreOn ? "PASS" : "WARN",
+      details: err("dbSettingsExtended") ?? (queryStoreOn ? "Query Store is enabled for performance monitoring." : "Query Store is not enabled."),
+      recommendation: "Enable with: ALTER DATABASE SET QUERY_STORE = ON",
+    });
+
+    // WH-042: Excessive computed columns
+    const computedCols = rows("computedColumns");
+    const allColCounts = rows("allColumns");
+    const tablesWithExcessiveComputed: string[] = [];
+    for (const tc of allColCounts) {
+      const tbl = `${tc.schema_name}.${tc.table_name}`;
+      const totalCols = tc.col_count as number;
+      const compCount = computedCols.filter(c => `${c.schema_name}.${c.table_name}` === tbl).length;
+      if (totalCols > 0 && compCount / totalCols > 0.3) {
+        tablesWithExcessiveComputed.push(`${tbl} (${compCount}/${totalCols})`);
+      }
+    }
+    rules.push({
+      id: "WH-042", rule: "No Excessive Computed Columns", category: "Maintainability", severity: "LOW",
+      status: err("computedColumns") ? "ERROR" : tablesWithExcessiveComputed.length === 0 ? "PASS" : "WARN",
+      details: err("computedColumns") ?? (tablesWithExcessiveComputed.length === 0 ? "No tables with >30% computed columns." : `${tablesWithExcessiveComputed.length} table(s): ${tablesWithExcessiveComputed.slice(0, 3).join(", ")}`),
+      recommendation: "Review computed columns — consider materializing in source or using views.",
+    });
+
+    // WH-043: Query hints audit
+    const hintObjects = rows("queryHints");
+    rules.push({
+      id: "WH-043", rule: "No Forced Query Hints", category: "Performance", severity: "LOW",
+      status: err("queryHints") ? "ERROR" : hintObjects.length === 0 ? "PASS" : "WARN",
+      details: err("queryHints") ?? (hintObjects.length === 0 ? "No objects using query hints." : `${hintObjects.length} object(s) using hints: ${hintObjects.slice(0, 3).map(h => h.object_name).join(", ")}`),
+      recommendation: "Review NOLOCK/FORCESEEK hints — they may mask optimizer issues.",
+    });
+
+    // WH-044: Missing indexes on FK columns
+    const missingFkIdx = rows("fkWithoutIndex");
+    rules.push({
+      id: "WH-044", rule: "FK Columns Have Indexes", category: "Performance", severity: "MEDIUM",
+      status: err("fkWithoutIndex") ? "ERROR" : missingFkIdx.length === 0 ? "PASS" : "WARN",
+      details: err("fkWithoutIndex") ?? (missingFkIdx.length === 0 ? "All FK columns have supporting indexes." : `${missingFkIdx.length} FK column(s) missing indexes: ${missingFkIdx.slice(0, 3).map(f => `${f.table_name}.${f.column_name}`).join(", ")}`),
+      recommendation: "Create indexes on FK columns for better join performance.",
+    });
+
   return renderRuleReport(
     `Warehouse Analysis: ${warehouse.displayName}`,
     new Date().toISOString(),
@@ -1170,6 +1248,27 @@ const WAREHOUSE_FIXES: Record<string, {
       );
     },
   },
+  "WH-040": {
+    description: "Enable AUTO_CREATE_STATISTICS",
+    getSql: (args) => [`ALTER DATABASE [${args.warehouseName ?? "current"}] SET AUTO_CREATE_STATISTICS ON`],
+  },
+  "WH-041": {
+    description: "Enable Query Store",
+    getSql: (args) => [`ALTER DATABASE [${args.warehouseName ?? "current"}] SET QUERY_STORE = ON`],
+  },
+  "WH-044": {
+    description: "Create indexes on FK columns missing them",
+    getSql: (_args, diag) => {
+      const missing = diag.fkWithoutIndex?.rows ?? [];
+      return missing.slice(0, 10).map(r => {
+        const schema = r.schema_name as string;
+        const table = r.table_name as string;
+        const col = r.column_name as string;
+        const safeName = `${schema}_${table}_${col}`.replace(/[^a-zA-Z0-9_]/g, "_");
+        return `CREATE NONCLUSTERED INDEX [IX_FK_${safeName}] ON [${schema}].[${table}] ([${col}])`;
+      });
+    },
+  },
 };
 
 export async function warehouseFix(args: {
@@ -1194,7 +1293,8 @@ export async function warehouseFix(args: {
   const DIAG_QUERIES: Record<string, string> = {};
   // Only include queries needed by the fixes
   const neededQueries = ["missingPrimaryKeys", "nullableKeyColumns", "staleStatistics", "constraintCheck",
-    "missingAuditColumns", "sensitiveColumns", "dataMaskingCheck", "tables", "stats", "missingDefaults", "dbSettings"];
+    "missingAuditColumns", "sensitiveColumns", "dataMaskingCheck", "tables", "stats", "missingDefaults", "dbSettings",
+    "fkWithoutIndex", "dbSettingsExtended"];
   for (const key of neededQueries) {
     const allDiag = WAREHOUSE_DIAGNOSTICS as Record<string, string>;
     if (allDiag[key]) DIAG_QUERIES[key] = allDiag[key];
@@ -1352,8 +1452,9 @@ export const warehouseTools = [
     description:
       "AUTO-FIX: Connects to a Fabric Warehouse and applies fixes for detected issues. " +
       "Can fix: stale statistics, missing PKs, disabled constraints, missing audit columns, " +
-      "sensitive data masking, database settings (AUTO_UPDATE_STATISTICS, result set caching, " +
-      "snapshot isolation, ANSI settings), and missing default constraints. " +
+      "sensitive data masking, database settings (AUTO_UPDATE_STATISTICS, AUTO_CREATE_STATISTICS, result set caching, " +
+      "snapshot isolation, ANSI settings), Query Store, and missing FK indexes. " +
+      "Fixable rule IDs: WH-001, WH-008, WH-026, WH-027, WH-028, WH-029, WH-030, WH-032, WH-036, WH-040, WH-041, WH-044. " +
       "Specify ruleIds to fix specific issues, or omit to fix all auto-fixable issues. " +
       "Use dryRun=true to preview SQL commands without executing them.",
     inputSchema: {
@@ -1386,7 +1487,9 @@ export const warehouseTools = [
     description:
       "AUTO-OPTIMIZE: Scans a Fabric Warehouse for all fixable issues and applies all safe fixes automatically. " +
       "Runs diagnostics first, then applies: stale statistics refresh, PK constraints, ANSI settings, " +
-      "result set caching, snapshot isolation, and more. Use dryRun=true to preview.",
+      "result set caching, snapshot isolation, AUTO_CREATE_STATISTICS, Query Store, FK indexes, and more. " +
+      "Fixable rule IDs: WH-001, WH-008, WH-026, WH-027, WH-028, WH-029, WH-030, WH-032, WH-036, WH-040, WH-041, WH-044. " +
+      "Use dryRun=true to preview.",
     inputSchema: {
       type: "object" as const,
       properties: {

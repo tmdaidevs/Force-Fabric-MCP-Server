@@ -250,6 +250,28 @@ const KQL_DIAGNOSTICS = {
       | limit 20`,
     isMgmt: true,
   },
+  autocompactionPolicy: {
+    query: ".show database policy autocompaction",
+    isMgmt: true,
+  },
+  extentTagsRetention: {
+    query: ".show database policy extent_tags_retention",
+    isMgmt: true,
+  },
+  shardingPolicy: {
+    query: ".show table * policy sharding",
+    isMgmt: true,
+  },
+  materializedViewDetails: {
+    query: `.show materialized-views
+      | project Name, SourceTable, Query, IsHealthy, IsEnabled,
+               MaterializedTo, LastRun, LastRunResult`,
+    isMgmt: true,
+  },
+  reservedColumns: {
+    query: `.show database schema as json | project DatabaseSchema`,
+    isMgmt: true,
+  },
 };
 
 // ──────────────────────────────────────────────
@@ -649,6 +671,93 @@ export async function eventhouseOptimizationRecommendations(args: {
       details: err("functions") ?? (functions.length > 0 ? `${functions.length} stored function(s) registered.` : "No stored functions."),
       recommendation: "Review stored functions periodically and remove unused ones.",
     });
+
+    // EH-021: Autocompaction Policy
+    rules.push({
+      id: "EH-021", rule: `${pre}Autocompaction Policy Enabled`, category: "Performance", severity: "MEDIUM",
+      status: err("autocompactionPolicy") ? (err("autocompactionPolicy")!.includes("Unknown") ? "N/A" : "ERROR") : cnt("autocompactionPolicy") > 0 ? "PASS" : "WARN",
+      details: err("autocompactionPolicy") ? (err("autocompactionPolicy")!.includes("Unknown") ? "Autocompaction policy not available on this cluster." : err("autocompactionPolicy")!) : (cnt("autocompactionPolicy") > 0 ? "Database autocompaction policy is configured." : "No autocompaction policy — using defaults."),
+      recommendation: "Configure autocompaction to automatically merge small extents.",
+    });
+
+    // EH-022: Extent Tags Retention
+    rules.push({
+      id: "EH-022", rule: `${pre}Extent Tags Retention Configured`, category: "Data Management", severity: "LOW",
+      status: err("extentTagsRetention") ? (err("extentTagsRetention")!.includes("Unknown") ? "N/A" : "ERROR") : cnt("extentTagsRetention") > 0 ? "PASS" : "WARN",
+      details: err("extentTagsRetention") ? (err("extentTagsRetention")!.includes("Unknown") ? "Extent tags retention not available." : err("extentTagsRetention")!) : (cnt("extentTagsRetention") > 0 ? "Extent tags retention policy configured." : "No extent tags retention policy."),
+      recommendation: "Set extent tags retention to clean up old tags and reduce metadata overhead.",
+    });
+
+    // EH-023: Sharding Policy
+    const shardingRows = kqlRows("shardingPolicy");
+    const tablesWithSharding = shardingRows.filter(x => {
+      const ps = policyString(x, "Policy", "ShardingPolicy");
+      return ps && ps !== "null" && ps !== "{}" && ps !== "";
+    });
+    rules.push({
+      id: "EH-023", rule: `${pre}Sharding Policy Configured`, category: "Performance", severity: "INFO",
+      status: err("shardingPolicy") ? "ERROR" : "PASS",
+      details: err("shardingPolicy") ?? (tablesWithSharding.length > 0 ? `${tablesWithSharding.length} table(s) with custom sharding policies.` : "All tables using default sharding policy."),
+    });
+
+    // EH-024: Streaming Ingestion Optimization
+    const allTableDetails = kqlRows("tableDetails");
+    const tablesWithStreaming = kqlRows("streamingIngestion").filter(x => {
+      const ps = policyString(x, "Policy", "StreamingIngestionPolicy");
+      return ps.includes("true") || ps.includes("Enabled");
+    });
+    const largeTblsWithoutStreaming = allTableDetails.filter(x => {
+      const rows = x.TotalRowCount as number ?? 0;
+      if (rows < 1000000) return false;
+      const tbl = x.TableName as string;
+      return !tablesWithStreaming.some(s => (s.EntityName ?? s.TableName) === tbl);
+    });
+    rules.push({
+      id: "EH-024", rule: `${pre}Streaming Ingestion on High-Volume Tables`, category: "Performance", severity: "LOW",
+      status: err("streamingIngestion") ? "ERROR" : largeTblsWithoutStreaming.length === 0 ? "PASS" : "WARN",
+      details: err("streamingIngestion") ?? (largeTblsWithoutStreaming.length === 0 ? "All high-volume tables have streaming or are using batching." : `${largeTblsWithoutStreaming.length} high-volume table(s) could benefit from streaming ingestion.`),
+      recommendation: "Enable streaming ingestion for low-latency data availability on high-volume tables.",
+    });
+
+    // EH-025: Materialized View Staleness
+    const viewDetails = kqlRows("materializedViewDetails");
+    const staleViews = viewDetails.filter(v => {
+      const lastRun = v.LastRun as string | null;
+      if (!lastRun) return false;
+      return (Date.now() - new Date(lastRun).getTime()) / (3600 * 1000) > 24;
+    });
+    rules.push({
+      id: "EH-025", rule: `${pre}Materialized Views Fresh (<24h)`, category: "Data Quality", severity: "MEDIUM",
+      status: err("materializedViewDetails") ? "ERROR" : viewDetails.length === 0 ? "N/A" : staleViews.length === 0 ? "PASS" : "WARN",
+      details: err("materializedViewDetails") ?? (viewDetails.length === 0 ? "No materialized views." : staleViews.length === 0 ? `All ${viewDetails.length} view(s) refreshed within 24h.` : `${staleViews.length} view(s) stale (>24h since last refresh).`),
+      recommendation: "Investigate stale materialized views — check source table availability and resource limits.",
+    });
+
+    // EH-026: Query Cache Utilization
+    const queryPerf = kqlRows("queryPerformance");
+    const totalQueries = queryPerf.reduce((s, x) => s + ((x.QueryCount as number) ?? 0), 0);
+    rules.push({
+      id: "EH-026", rule: `${pre}Query Volume Health`, category: "Performance", severity: "INFO",
+      status: "PASS",
+      details: err("queryPerformance") ?? `${totalQueries.toLocaleString()} queries in last 7 days across ${queryPerf.length} pattern(s).`,
+    });
+
+    // EH-027: Ingestion Latency
+    const recentData = kqlRows("dataFreshness");
+    const highLatency = recentData.filter(x => {
+      const maxTs = x.MaxExtentsCreationTime as string | null;
+      const minTs = x.MinExtentsCreationTime as string | null;
+      if (!maxTs || !minTs) return false;
+      const rows = x.TotalRowCount as number ?? 0;
+      if (rows < 1000) return false;
+      return (Date.now() - new Date(maxTs).getTime()) / (3600 * 1000) > 1;
+    });
+    rules.push({
+      id: "EH-027", rule: `${pre}Ingestion Latency (<1h)`, category: "Data Quality", severity: "MEDIUM",
+      status: err("dataFreshness") ? "ERROR" : highLatency.length === 0 ? "PASS" : "WARN",
+      details: err("dataFreshness") ?? (highLatency.length === 0 ? "All active tables have data within 1 hour." : `${highLatency.length} table(s) with ingestion lag >1h.`),
+      recommendation: "Check ingestion pipeline status and batching configuration.",
+    });
   }
 
   return renderRuleReport(
@@ -753,6 +862,49 @@ const EVENTHOUSE_FIXES: Record<string, EventhouseFixDef> = {
       return fragmented.map(r => `.alter table ['${r.TableName}'] policy merge @'{"MaxRangeInHours":24,"RowCountUpperBoundForMerge":16000000}'`);
     },
   },
+  "EH-021": {
+    description: "Enable autocompaction policy",
+    getCommands: (args) => {
+      return [`.alter database ['${args.dbName}'] policy autocompaction @'{"Enabled":true}'`];
+    },
+  },
+  "EH-022": {
+    description: "Set extent tags retention policy",
+    getCommands: (args) => {
+      return [`.alter database ['${args.dbName}'] policy extent_tags_retention @'[{"TagPrefix":"drop-by:","RetentionPeriod":"7.00:00:00"}]'`];
+    },
+  },
+  "EH-024": {
+    description: "Enable streaming ingestion on high-volume tables",
+    getCommands: (args, diag) => {
+      if (args.tableName) {
+        return [`.alter table ['${args.tableName}'] policy streamingingestion enable`];
+      }
+      const allTables = (diag.tableDetails?.rows ?? []).filter(x => (x.TotalRowCount as number ?? 0) > 1000000);
+      const streaming = new Set(
+        (diag.streamingIngestion?.rows ?? [])
+          .filter(x => {
+            const ps = policyString(x, "Policy", "StreamingIngestionPolicy");
+            return ps.includes("true") || ps.includes("Enabled");
+          })
+          .map(x => x.EntityName ?? x.TableName)
+      );
+      return allTables
+        .filter(t => !streaming.has(t.TableName as string))
+        .map(t => `.alter table ['${t.TableName}'] policy streamingingestion enable`);
+    },
+  },
+  "EH-025": {
+    description: "Refresh stale materialized views",
+    getCommands: (_args, diag) => {
+      const views = (diag.materializedViewDetails?.rows ?? []).filter(v => {
+        const lastRun = v.LastRun as string | null;
+        if (!lastRun) return true;
+        return (Date.now() - new Date(lastRun).getTime()) / (3600 * 1000) > 24;
+      });
+      return views.map(v => `.refresh materialized-view ['${v.Name ?? v.MaterializedViewName}']`);
+    },
+  },
 };
 
 const FIXABLE_RULE_IDS = Object.keys(EVENTHOUSE_FIXES);
@@ -810,6 +962,9 @@ export async function eventhouseFix(args: {
       extentStats: KQL_DIAGNOSTICS.extentStats,
       materializedViews: KQL_DIAGNOSTICS.materializedViews,
       partitioningPolicies: KQL_DIAGNOSTICS.partitioningPolicies,
+      tableDetails: KQL_DIAGNOSTICS.tableDetails,
+      streamingIngestion: KQL_DIAGNOSTICS.streamingIngestion,
+      materializedViewDetails: KQL_DIAGNOSTICS.materializedViewDetails,
     };
     const diagnostics = await runKqlDiagnostics(queryUri, db.displayName, diagKeys);
 
@@ -1174,14 +1329,15 @@ export const eventhouseTools = [
     description:
       "AUTO-FIX: Applies fixes to a Fabric Eventhouse. " +
       "Fixable rules: EH-002 (merge fragmentation), EH-004 (caching), EH-005 (retention), " +
-      "EH-006 (re-enable materialized views), EH-014 (ingestion batching), EH-016 (partitioning), EH-017 (merge policy). " +
+      "EH-006 (re-enable materialized views), EH-014 (ingestion batching), EH-016 (partitioning), EH-017 (merge policy), " +
+      "EH-021 (autocompaction), EH-022 (extent tags retention), EH-024 (streaming ingestion), EH-025 (refresh stale materialized views). " +
       "Use dryRun=true to preview commands without executing them.",
     inputSchema: {
       type: "object" as const,
       properties: {
         workspaceId: { type: "string", description: "The ID of the Fabric workspace" },
         eventhouseId: { type: "string", description: "The ID of the eventhouse to fix" },
-        ruleIds: { type: "array", items: { type: "string" }, description: "Rule IDs to fix: EH-002, EH-004, EH-005, EH-006, EH-014, EH-016, EH-017" },
+        ruleIds: { type: "array", items: { type: "string" }, description: "Rule IDs to fix: EH-002, EH-004, EH-005, EH-006, EH-014, EH-016, EH-017, EH-021, EH-022, EH-024, EH-025" },
         kqlDatabaseName: { type: "string", description: "Optional: specific KQL database name" },
         tableName: { type: "string", description: "Optional: specific table name" },
         cachingDays: { type: "number", description: "Hot cache days (default: 30)" },
@@ -1197,7 +1353,8 @@ export const eventhouseTools = [
     description:
       "AUTO-OPTIMIZE: Scans a Fabric Eventhouse for all fixable issues across all KQL databases and applies fixes. " +
       "Covers: merge fragmentation, caching policies, retention policies, materialized views, " +
-      "ingestion batching, partitioning, merge policy. Use dryRun=true to preview.",
+      "ingestion batching, partitioning, merge policy, autocompaction, extent tags retention, " +
+      "streaming ingestion, stale materialized view refresh. Use dryRun=true to preview.",
     inputSchema: {
       type: "object" as const,
       properties: {

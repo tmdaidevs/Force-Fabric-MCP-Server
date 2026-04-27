@@ -750,6 +750,24 @@ export async function lakehouseOptimizationRecommendations(args: {
       recommendation: "Add a unique identifier column (ID/Key) for row identification and joins.",
     });
 
+    // ══════════════════════════════════════════════
+    // RULE LH-031: Tables with Nested/Complex Types
+    // ══════════════════════════════════════════════
+    const nestedCols = (sql.columnInfo?.rows ?? []).filter((c: SqlRow) => {
+      const dt = ((c.DATA_TYPE as string) ?? "").toLowerCase();
+      return dt === "array" || dt === "struct" || dt === "map" || dt.includes("row(");
+    });
+    rules.push({
+      id: "LH-031", rule: "No Deeply Nested Types", category: "Performance", severity: "LOW",
+      status: sql.columnInfo?.error ? "ERROR" : nestedCols.length === 0 ? "PASS" : "WARN",
+      details: sql.columnInfo?.error
+        ? `Could not check: ${sql.columnInfo.error}`
+        : nestedCols.length === 0
+          ? "No nested complex type columns found."
+          : `${nestedCols.length} column(s) with nested types (STRUCT/ARRAY/MAP).`,
+      recommendation: "Consider flattening nested types for better query performance and Direct Lake compatibility.",
+    });
+
   } else {
     // SQL endpoint not available — mark all SQL rules as N/A
     const sqlRuleIds = ["LH-005","LH-006","LH-007","LH-008","LH-009","LH-010","LH-011","LH-012","LH-013","LH-014","LH-015"];
@@ -995,6 +1013,94 @@ export async function lakehouseOptimizationRecommendations(args: {
             : `${needsZOrder.length} large table(s) >10GB without Z-Order: ${needsZOrder.join(", ")}`,
           recommendation: "OPTIMIZE table ZORDER BY (frequently filtered columns) for faster queries.",
         });
+
+        // ══════════════════════════════════════════════
+        // RULE LH-026: V-Order Enabled
+        // ══════════════════════════════════════════════
+        const noVOrder: string[] = [];
+        for (const { table, log } of deltaLogResults) {
+          const config = getTableConfig(log);
+          if (!config["delta.parquet.vorder.enabled"] || config["delta.parquet.vorder.enabled"] !== "true") {
+            noVOrder.push(table);
+          }
+        }
+        rules.push({
+          id: "LH-026", rule: "V-Order Enabled", category: "Performance", severity: "MEDIUM",
+          status: noVOrder.length === 0 ? "PASS" : "WARN",
+          details: noVOrder.length === 0 ? "All tables have V-Order enabled." : `${noVOrder.length} table(s) without V-Order: ${noVOrder.slice(0, 3).join(", ")}`,
+          recommendation: "Enable V-Order for 30-50% better compression and faster reads. Fix: v-order",
+        });
+
+        // ══════════════════════════════════════════════
+        // RULE LH-027: Change Data Feed on Large Tables
+        // ══════════════════════════════════════════════
+        const largeDeltaWithoutCDF: string[] = [];
+        for (const { table, log } of deltaLogResults) {
+          const config = getTableConfig(log);
+          const stats = getFileSizeStats(log);
+          if (stats.totalFiles > 0 && config["delta.enableChangeDataFeed"] !== "true") {
+            // Check if table is "large" via file count as proxy (>100 files)
+            if (stats.totalFiles > 100) {
+              largeDeltaWithoutCDF.push(table);
+            }
+          }
+        }
+        rules.push({
+          id: "LH-027", rule: "Change Data Feed on Large Tables", category: "Data Management", severity: "LOW",
+          status: largeDeltaWithoutCDF.length === 0 ? "PASS" : "WARN",
+          details: largeDeltaWithoutCDF.length === 0 ? "All large tables have CDF enabled." : `${largeDeltaWithoutCDF.length} large table(s) without Change Data Feed.`,
+          recommendation: "Enable CDF for incremental ETL. Fix: change-data-feed",
+        });
+
+        // ══════════════════════════════════════════════
+        // RULE LH-028: Column Mapping Enabled
+        // ══════════════════════════════════════════════
+        const withoutColMapping: string[] = [];
+        for (const { table, log } of deltaLogResults) {
+          const config = getTableConfig(log);
+          if (!config["delta.columnMapping.mode"] || config["delta.columnMapping.mode"] === "none") {
+            withoutColMapping.push(table);
+          }
+        }
+        rules.push({
+          id: "LH-028", rule: "Column Mapping Enabled", category: "Maintainability", severity: "LOW",
+          status: withoutColMapping.length === 0 ? "PASS" : "WARN",
+          details: withoutColMapping.length === 0 ? "All tables have column mapping." : `${withoutColMapping.length} table(s) without column mapping mode=name.`,
+          recommendation: "Enable column mapping for schema evolution support. Fix: column-mapping",
+        });
+
+        // ══════════════════════════════════════════════
+        // RULE LH-029: Deletion Vectors Enabled
+        // ══════════════════════════════════════════════
+        const withoutDV: string[] = [];
+        for (const { table, log } of deltaLogResults) {
+          const config = getTableConfig(log);
+          if (config["delta.enableDeletionVectors"] !== "true") {
+            withoutDV.push(table);
+          }
+        }
+        rules.push({
+          id: "LH-029", rule: "Deletion Vectors Enabled", category: "Performance", severity: "LOW",
+          status: withoutDV.length === 0 ? "PASS" : "WARN",
+          details: withoutDV.length === 0 ? "All tables have deletion vectors." : `${withoutDV.length} table(s) without deletion vectors.`,
+          recommendation: "Enable deletion vectors for faster UPDATE/DELETE/MERGE. Fix: deletion-vectors",
+        });
+
+        // ══════════════════════════════════════════════
+        // RULE LH-030: Checkpoint Interval Check
+        // ══════════════════════════════════════════════
+        const badCheckpoint: string[] = [];
+        for (const { table, log } of deltaLogResults) {
+          const config = getTableConfig(log);
+          const interval = parseInt(config["delta.checkpointInterval"] ?? "10", 10);
+          if (interval > 50) badCheckpoint.push(table);
+        }
+        rules.push({
+          id: "LH-030", rule: "Checkpoint Interval Appropriate", category: "Performance", severity: "LOW",
+          status: badCheckpoint.length === 0 ? "PASS" : "WARN",
+          details: badCheckpoint.length === 0 ? "All tables have reasonable checkpoint intervals." : `${badCheckpoint.length} table(s) with high checkpoint interval (>50).`,
+          recommendation: "Set checkpoint interval to 10 for faster query startup. Fix: checkpoint-interval",
+        });
       }
     }
   }
@@ -1034,6 +1140,36 @@ const LAKEHOUSE_FIX_COMMANDS: Record<string, {
     description: "Add created_at and updated_at audit columns (idempotent)",
     getCode: (lh, t) =>
       `existing = [c.name.lower() for c in spark.table("\`${lh}\`.\`${t}\`").schema]\nadded = []\nif "created_at" not in existing:\n    spark.sql("ALTER TABLE \`${lh}\`.\`${t}\` ADD COLUMNS (created_at TIMESTAMP)")\n    added.append("created_at")\nif "updated_at" not in existing:\n    spark.sql("ALTER TABLE \`${lh}\`.\`${t}\` ADD COLUMNS (updated_at TIMESTAMP)")\n    added.append("updated_at")\nif added:\n    print(f"✅ Added {', '.join(added)} to ${t}")\nelse:\n    print("✅ Audit columns already exist on ${t} - skipped")`,
+  },
+  "v-order": {
+    description: "Enable V-Order compression for better read performance",
+    getCode: (lh, t) =>
+      `spark.sql("ALTER TABLE \`${lh}\`.\`${t}\` SET TBLPROPERTIES ('delta.parquet.vorder.enabled' = 'true')")\nprint("✅ V-Order enabled for ${t}")`,
+  },
+  "change-data-feed": {
+    description: "Enable Change Data Feed for incremental processing",
+    getCode: (lh, t) =>
+      `spark.sql("ALTER TABLE \`${lh}\`.\`${t}\` SET TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')")\nprint("✅ Change Data Feed enabled for ${t}")`,
+  },
+  "column-mapping": {
+    description: "Enable column mapping mode=name for schema evolution",
+    getCode: (lh, t) =>
+      `spark.sql("ALTER TABLE \`${lh}\`.\`${t}\` SET TBLPROPERTIES ('delta.columnMapping.mode' = 'name', 'delta.minReaderVersion' = '2', 'delta.minWriterVersion' = '5')")\nprint("✅ Column mapping enabled for ${t}")`,
+  },
+  "checkpoint-interval": {
+    description: "Set optimal checkpoint interval (10 commits)",
+    getCode: (lh, t) =>
+      `spark.sql("ALTER TABLE \`${lh}\`.\`${t}\` SET TBLPROPERTIES ('delta.checkpointInterval' = '10')")\nprint("✅ Checkpoint interval set for ${t}")`,
+  },
+  "deletion-vectors": {
+    description: "Enable deletion vectors for faster deletes/updates",
+    getCode: (lh, t) =>
+      `spark.sql("ALTER TABLE \`${lh}\`.\`${t}\` SET TBLPROPERTIES ('delta.enableDeletionVectors' = 'true')")\nprint("✅ Deletion vectors enabled for ${t}")`,
+  },
+  "compute-stats": {
+    description: "Compute table statistics for query optimization",
+    getCode: (lh, t) =>
+      `spark.sql("ANALYZE TABLE \`${lh}\`.\`${t}\` COMPUTE STATISTICS")\nprint("✅ Statistics computed for ${t}")`,
   },
 };
 
@@ -1394,9 +1530,10 @@ export const lakehouseTools = [
     description:
       "AUTO-FIX: Applies Spark SQL fixes to a Lakehouse via Livy API (no notebooks needed). " +
       "Falls back to temporary Notebook if Livy is unavailable. " +
-      "Can fix: auto-optimize, retention policy, data skipping, audit columns. " +
+      "Can fix: auto-optimize, retention policy, data skipping, audit columns, " +
+      "v-order, change-data-feed, column-mapping, checkpoint-interval, deletion-vectors, compute-stats. " +
       "Use dryRun=true to preview commands without executing them. " +
-      "Available fixIds: auto-optimize, retention, data-skipping, audit-columns.",
+      "Available fixIds: auto-optimize, retention, data-skipping, audit-columns, v-order, change-data-feed, column-mapping, checkpoint-interval, deletion-vectors, compute-stats.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -1405,7 +1542,7 @@ export const lakehouseTools = [
         tableName: { type: "string", description: "The table to fix" },
         fixIds: {
           type: "array", items: { type: "string" },
-          description: "Fix IDs to apply: auto-optimize, retention, data-skipping, audit-columns. If omitted, all are applied.",
+          description: "Fix IDs to apply: auto-optimize, retention, data-skipping, audit-columns, v-order, change-data-feed, column-mapping, checkpoint-interval, deletion-vectors, compute-stats. If omitted, all are applied.",
         },
         dryRun: {
           type: "boolean",
@@ -1422,7 +1559,8 @@ export const lakehouseTools = [
       "AUTO-OPTIMIZE: Discovers ALL Delta tables in a Lakehouse and applies fixes to every table " +
       "in a single Livy Spark session (no notebooks needed). " +
       "Default fixes: auto-optimize, retention, data-skipping. " +
-      "Use dryRun=true to preview. Use fixIds to select specific fixes.",
+      "Use dryRun=true to preview. Use fixIds to select specific fixes. " +
+      "Additional fixes: v-order, change-data-feed, column-mapping, checkpoint-interval, deletion-vectors, compute-stats.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -1430,7 +1568,7 @@ export const lakehouseTools = [
         lakehouseId: { type: "string", description: "The ID of the lakehouse" },
         fixIds: {
           type: "array", items: { type: "string" },
-          description: "Fix IDs: auto-optimize, retention, data-skipping, audit-columns. Default: first three.",
+          description: "Fix IDs: auto-optimize, retention, data-skipping, audit-columns, v-order, change-data-feed, column-mapping, checkpoint-interval, deletion-vectors, compute-stats. Default: first three.",
         },
         dryRun: {
           type: "boolean",

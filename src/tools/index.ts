@@ -4,6 +4,7 @@ import { warehouseTools } from "./warehouse.js";
 import { eventhouseTools } from "./eventhouse.js";
 import { semanticModelTools } from "./semanticModel.js";
 import { workspaceTools } from "./workspace.js";
+import { gatewayTools } from "./gateway.js";
 
 export interface ToolDefinition {
   name: string;
@@ -26,6 +27,7 @@ export const allTools: ToolDefinition[] = [
   ...warehouseTools,
   ...eventhouseTools,
   ...semanticModelTools,
+  ...gatewayTools,
 ] as ToolDefinition[];
 
 export function getToolByName(name: string): ToolDefinition | undefined {
